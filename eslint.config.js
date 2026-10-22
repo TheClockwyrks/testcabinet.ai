@@ -43,8 +43,8 @@ import tseslint from "typescript-eslint";
  * file set below is derived from this list, so bringing a project under the
  * gate is one entry here. A project that arrives with violations of its own is
  * recorded in the ratchet's baseline, `eslint-suppressions.json`, with
- * `npm run lint:baseline` (see the Linting section of
- * `apps/docs/src/content/docs/development/building.md`).
+ * `npm run lint:baseline` (see the Linting section of the building page of
+ * The Test Cabinet's documentation).
  */
 const PROJECTS = [
   { sources: "apps/site/src", tsconfig: "apps/site/tsconfig.json" },
@@ -63,13 +63,15 @@ const TESTS = PROJECTS.flatMap(({ sources }) => [
  * The programs that configure a build rather than run in a browser.
  *
  * They are linted without the type-checked rules because a build's
- * configuration is not a member of the project it configures. A Vite plugin a
- * configuration loads (the gallery's two) is part of that configuration.
+ * configuration is not a member of the project it configures. A module a
+ * configuration loads (the gallery's two Vite plugins and the development
+ * server's linked checkouts) is part of that configuration.
  */
 const CONFIGS = [
   "eslint.config.js",
   "apps/site/vite.config.ts",
   "apps/site/vite-plugin-*.ts",
+  "apps/site/linked-checkouts*.ts",
 ];
 
 /**
@@ -117,65 +119,11 @@ const CONFIG = defineConfig([
     "**/dist/**",
     // Cargo's build output, because rustdoc's own JavaScript lands in it.
     "**/target/**",
-    // The documentation site is Astro's own toolchain, and `astro check` is the
-    // gate it answers to.
-    "apps/docs/**",
     // The gallery's static assets, served verbatim rather than compiled.
     "apps/site/public/**",
     // Scratch work, which `.gitignore` keeps out of the repository and the
-    // prose and format gates leave alone. It may hold another repository, whose
-    // files and whose own configuration are none of this gate's business.
+    // prose and format gates leave alone.
     "tmp/**",
-    // The project's own ignored paths, which the prose and format gates
-    // (.markdownlint-cli2.yaml, cspell.json, .prettierignore) leave out too, so no
-    // gate reads what the others leave alone.
-    "cold-storage/**",
-    // The contracts, engines, gg, gg.rocks, microservice-arena, microservice-artifacts, microservice-dispatcher, microservice-driver,
-    // microservice-repos, tool-model-core, tool-paint, tool-particle,
-    // tool-sprite, tool-voxel, tool-mc, tool-sn, tool-dc, tool-audio-core,
-    // tool-sfx-synth, tool-sfx-sample, tool-music, test-suites, ui-common and
-    // console.testcabinet.ai repositories, submodules with gates of their own,
-    // and the docs tree's gg/ entry, which points into the gg checkout.
-    "contracts/**",
-    "engines/**",
-    "gg/**",
-    "gg.rocks/**",
-    "microservice-arena/**",
-    "microservice-artifacts/**",
-    "microservice-dispatcher/**",
-    "microservice-driver/**",
-    "microservice-repos/**",
-    "tool-model-core/**",
-    "tool-paint/**",
-    "tool-particle/**",
-    "tool-sprite/**",
-    "tool-voxel/**",
-    "tool-mc/**",
-    "tool-sn/**",
-    "tool-dc/**",
-    "tool-audio-core/**",
-    "tool-sfx-synth/**",
-    "tool-sfx-sample/**",
-    "tool-music/**",
-    "apps/docs/src/content/docs/gg/**",
-    "test-suites/**",
-    "ui-common/**",
-    "console.testcabinet.ai/**",
-    "tasks/**/done/**",
-    ".claude/workflows/**",
-    ".claude/worktrees/**",
-    "crates/*/testdata/definitions/**",
-    "**/*.hbs",
-    "**/.build/**",
-    "**/.spago/**",
-    "**/.vendor/**",
-    "**/vendor/**",
-    "**/.gg/**",
-    "runs/**",
-    "tcab-store/**",
-    "tcab-artifacts/**",
-    ".tcab-driver/**",
-    "reference-previews/**",
   ]),
   {
     // The app's own sources, linted with type information: the type-checked

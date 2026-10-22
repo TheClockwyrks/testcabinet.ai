@@ -20,13 +20,21 @@ import { createServer } from "vite";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CAPTURE_ROOT = path.join(HERE, "capture");
-// The baked stills live beside the fallback that consumes them, so every host
-// that bundles `@clockwyrks/ui` (site, web console) emits them
-// automatically.
-const OUTPUT_DIR = path.resolve(
-  HERE,
-  "../../../ui-common/packages/ui/src/app/components/backdrop",
+// The scene and the stills belong to `@clockwyrks/ui`, so they are read from
+// and written into a checkout of the ui-common repository: the one
+// `UI_COMMON_DIR` names, or `ui-common` beside this repository's checkout,
+// which is where the superrepo holds it. Its dependencies must be installed,
+// since the scene's imports resolve from there.
+const UI_COMMON_DIR = path.resolve(
+  process.env.UI_COMMON_DIR || path.join(HERE, "../../../../ui-common"),
 );
+// The `@clockwyrks/ui` package's sources inside that checkout, which the
+// capture page imports through the alias below.
+const UI_SOURCES = path.join(UI_COMMON_DIR, "packages/ui/src");
+// The baked stills live beside the fallback that consumes them, so every host
+// that bundles `@clockwyrks/ui` (the gallery, the console) emits them
+// automatically.
+const OUTPUT_DIR = path.join(UI_SOURCES, "app/components/backdrop");
 
 // The decorative sun is a user toggle (`sunEnabled`, on by default), so we bake
 // both states; the fallback swaps stills as the toggle changes, just like the
@@ -115,8 +123,20 @@ async function createCaptureServer() {
     configFile: false,
     root: CAPTURE_ROOT,
     plugins: [react()],
+    // React and three.js are resolved from this repository whoever imports
+    // them, so the scene's sources in the other checkout and the page here
+    // share one copy of each.
+    resolve: {
+      alias: { "@ui-sources": UI_SOURCES },
+      dedupe: ["react", "react-dom", "three"],
+    },
     logLevel: "error",
-    server: { host: "127.0.0.1", port: 0, strictPort: false },
+    server: {
+      host: "127.0.0.1",
+      port: 0,
+      strictPort: false,
+      fs: { allow: [CAPTURE_ROOT, UI_COMMON_DIR] },
+    },
   });
   await server.listen();
   const baseUrl = server.resolvedUrls?.local[0];
@@ -127,7 +147,20 @@ async function createCaptureServer() {
   return { baseUrl, close: () => server.close() };
 }
 
+// The ui-common checkout the scene is rendered from and the stills are written
+// into, refused with a message rather than failing inside Vite when it is not
+// there.
+function requireUiCommon() {
+  if (!fs.existsSync(path.join(OUTPUT_DIR, "SynthwaveScene.tsx"))) {
+    throw new Error(
+      `No ui-common checkout at ${UI_COMMON_DIR} (no ${path.relative(UI_COMMON_DIR, OUTPUT_DIR)}/SynthwaveScene.tsx). ` +
+        "Check out the ui-common repository beside this one, or name its directory in UI_COMMON_DIR.",
+    );
+  }
+}
+
 async function main() {
+  requireUiCommon();
   configurePlaywrightHostPlatformOverride();
   const { chromium } = await import("playwright");
 

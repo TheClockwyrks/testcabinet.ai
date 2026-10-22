@@ -10,6 +10,8 @@ target/
 dist/
 # npm writes this file and its formatting is npm's own.
 package-lock.json
+# ESLint writes the ratchet's baseline and its formatting is ESLint's own.
+/eslint-suppressions.json
 # Copier writes the answers file on every render and update, in its own
 # formatting.
 .copier-answers.yml

@@ -29,6 +29,13 @@ accordingly.
 | `.copier-answers.yml` | The answers this repository was rendered with and the superrepo commit its kit was last updated from; copier maintains it, and `scripts/repos/render.py --update` in the superrepo merges a kit change in from it |
 | `.test-cabinet-repo.toml` | The name, kind and description, rendered from those answers for the `dependency-edges` gate to read |
 | `azure-pipelines.yml` | The pipeline: every gate a step of its own on Azure Pipelines |
+| `apps/site/` | The gallery: a Vite and React host of `@clockwyrks/ui`, the workspace's one member |
+| `apps/site/vite-plugin-snapshot.ts` | The build's plugin that fetches the published dataset from `TCAB_SNAPSHOT_URL` and bakes it into the bundle, with its tests |
+| `apps/site/scripts/` | The screenshot helper and the backdrop capture, run from a checkout |
+| `eslint.config.js`, `eslint-suppressions.json` | The `web-lint` gate's configuration and its ratchet |
+| `scripts/ci/` | The pipeline's scripts, the kit's and the gallery's deploy, each with its `.test.sh` |
+| `.azure/project/` | The gallery's own pipeline templates: no jobs, and the `deploy` stage |
+| [`history/`](history/README.md) | How this repository's history was extracted from the monorepo |
 
 ## Rules this repository is held to
 

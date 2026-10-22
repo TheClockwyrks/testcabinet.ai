@@ -8,6 +8,8 @@
   "include": [
     "vite.config.ts",
     "vitest.config.ts",
+    "linked-checkouts.ts",
+    "linked-checkouts.test.ts",
     "snapshot-fetch.ts",
     "snapshot-fetch.test.ts",
     "vite-plugin-local-runs.ts",

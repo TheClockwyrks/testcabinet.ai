@@ -5,7 +5,6 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "predev": "tsc -b ../../contracts/packages/backend-api",
     "dev": "vite --host",
     "build": "tsc -b tsconfig.json tsconfig.node.json && vite build",
     "preview": "vite preview",
@@ -15,11 +14,11 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@clockwyrks/backend-api": "0.2.4",
+    "@clockwyrks/run-record": "0.2.4",
+    "@clockwyrks/ui": "0.1.1",
     "@observablehq/plot": "^0.6.16",
     "@react-three/fiber": "^9.6.1",
-    "@clockwyrks/backend-api": "*",
-    "@clockwyrks/run-record": "*",
-    "@clockwyrks/ui": "*",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
@@ -30,13 +29,15 @@
   },
   "devDependencies": {
     "@types/node": "^25.9.3",
-    "@types/three": "~0.185.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
+    "@types/three": "~0.185.0",
     "@vitejs/plugin-react": "^4.5.0",
+    "@vitest/coverage-v8": "5.0.0",
+    "playwright": "1.63.0",
     "sass": "^1.89.0",
     "typescript": "^6",
     "vite": "^6.3.0",
-    "vitest": "^5"
+    "vitest": "5.0.0"
   }
 }
