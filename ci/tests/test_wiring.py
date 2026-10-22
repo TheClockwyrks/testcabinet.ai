@@ -1,0 +1,639 @@
+"""Every place that runs a gate names one that exists, and the pipeline runs them all.
+
+The hooks and the pipeline name gates by id in plain command lines, where a
+renamed or deleted gate is found only when that line next runs. They are read
+as text: this repository has no YAML parser, by design.
+
+The pipeline gives each check a step of its own so that a step's duration is
+the cost of one check, on one track, the checks job. A
+gate has to land on exactly one of them. A gate that is trivial to run has a
+hook too, because the hook is what runs it at commit time; the ones that
+compile, build or run a test suite are named below as hookless on purpose, so
+the pipeline alone runs them.
+
+Each track runs inside a CI image the superrepo builds, pinned at the commit
+whose image pipeline run built it, the `ciImageTag` the superrepo's
+ci/images/tags.yml pins. The superrepo's render writes the pins and the track
+the Rust job runs; here each track is held to an image of its own, pulled
+through the project's service connection. Every repository runs for a tag too,
+and such a run publishes the workspace's public packages in a stage held to
+running after the gates, for a tag alone, and to running no gate of its own.
+This repository runs jobs and stages of its own, written in the templates
+under .azure/project/ that the kit leaves to it: its jobs are included in the
+gates stage and its stages after the publish, each handed the parameters it
+declares, none of them runs a gate, and every stage it declares follows the
+gates.
+A commit on master, staging or nightly, and a published tag, is pushed to the
+GitHub mirror by the last stage, held to running after the gates and the
+publish and this repository's own stages, on those refs alone, with the mirror's own deploy key.
+"""
+
+from __future__ import annotations
+
+import re
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from pathlib import Path
+
+import pytest
+
+from the_test_cabinet_ci import runner
+
+ROOT = Path(__file__).resolve().parents[2]
+GATE_IDS = {gate.id for gate in runner.discover(runner.gates_dir(ROOT))}
+CONFIG = ROOT / ".pre-commit-config.yaml"
+PIPELINE = ROOT / "azure-pipelines.yml"
+CALLERS = [CONFIG.name, PIPELINE.name]
+
+# The gates with no hook. A hook is paid for on every commit by every
+# developer, so only a check that finishes in moments is one. These compile
+# the workspace, run its tests or run the gate runner's own; each is usually
+# run before the commit, and the pipeline runs every gate regardless, so a
+# commit that skipped one is caught there rather than by a hook that repeats
+# the work. A gate that is absent from this repository's kind is simply not
+# among its gates.
+PIPELINE_ONLY = {"rust-clippy", "rust-doc", "rust-test", "shell-tests", "ci-tests"}
+# The gates this repository's kind adds are hookless for the same reason: each
+# builds or runs a test suite. The kit's render writes their ids into this
+# string, which is empty for a kind that adds none.
+KIND_PIPELINE_ONLY = "typescript"
+PIPELINE_ONLY |= set(KIND_PIPELINE_ONLY.split())
+# And so are the ones this repository adds over its kind's: on a Rust track that
+# drives a browser, the gate holding the workspace's Playwright to the image,
+# which needs the workspace installed; and the gates the repository writes
+# itself, each given a step by the kit's render.
+REPOSITORY_PIPELINE_ONLY = "web-lint"
+PIPELINE_ONLY |= set(REPOSITORY_PIPELINE_ONLY.split())
+
+# The gate tracks, and the image each runs in. The Rust track is a property of
+# this repository rather than of its kind: a repository whose Rust suite drives
+# a browser runs it in the rust-browser image, and every other one in the
+# shared `rust` image. The superrepo's render writes which.
+TRACKS = ("checks",)
+IMAGE_OF_TRACK = {"checks": "web"}
+SOURCES = "$(Build.SourcesDirectory)"
+# The same for the checks job, which a kind carrying no crate runs its tests
+# in: the repositories it checks out beside this one, each to the variable
+# naming its checkout, and the directory this repository's checkout is in.
+CHECKS_CHECKOUTS: dict[str, str] = {}
+CHECKS_DIR = ""
+CHECKS_ROOT = f"{SOURCES}/{CHECKS_DIR}" if CHECKS_DIR else SOURCES
+CHECKOUT = re.compile(r"^          - checkout: (?P<name>\S+) *\n(?P<keys>(?:            .*\n)*)", re.MULTILINE)
+IMAGE_ENDPOINT = "the-test-cabinet-acr"
+IMAGE = re.compile(r"^testcabinet\.azurecr\.io/ubuntu-the-test-cabinet-(?P<image>[a-z0-9-]+)-cicd:[0-9a-f]{40}$")
+# The Azure DevOps project every repository lives in, and the repositories a
+# run may fetch, the closure of this repository's Rust edges.
+AZURE_PROJECT = "the-test-cabinet"
+FETCHED: list[str] = []
+
+MIRROR_STAGE = "mirror"
+MIRROR_KEY = "github-mirror-key-testcabinet.ai"
+MIRROR_URL = "https://github.com/TheClockwyrks/testcabinet.ai"
+MIRROR_SCRIPT = "scripts/ci/mirror.sh"
+# This repository's own pipeline templates, the stages the second declares,
+# and what the pipeline hands each, by parameter; all empty for a repository
+# whose pipeline is the kit's alone.
+PROJECT_JOBS = ".azure/project/jobs.yml"
+PROJECT_STAGES_FILE = ".azure/project/stages.yml"
+PROJECT_STAGES: list[str] = ["deploy"]
+PROJECT_PARAMETERS: dict[str, str] = {
+    "registry": "testcabinet.azurecr.io",
+    "registryEndpoint": "the-test-cabinet-acr",
+    "arm64Pool": "pool-dev-linux-arm64-wus3-4c-eph-01",
+}
+# The steps the Rust job takes from this repository before its first check, or
+# nothing.
+PROJECT_SETUP = ""
+# The image this repository's kind builds, or none: the stage, the branches
+# it builds on, one job per architecture and the pool each runs on, and the
+# scripts and service connection the jobs use.
+BUILDS_IMAGE = False
+IMAGE_NAME = "testcabinet.ai"
+IMAGE_STAGE = "image"
+IMAGE_BRANCHES = ("master", "staging")
+IMAGE_POOLS = {"amd64": "vmImage: ubuntu-24.04", "arm64": "name: pool-dev-linux-arm64-wus3-4c-eph-01"}
+IMAGE_SCRIPT = "scripts/ci/image.sh"
+MANIFEST_SCRIPT = "scripts/ci/manifest.sh"
+BUILD_CONTEXT_GATE = "build-context"
+# The rewrite of the public sources to Azure, which a kind carrying a crate
+# runs before it fetches and one carrying none is rendered without.
+GIT_SOURCES_SCRIPT = "scripts/ci/git-sources.sh"
+FETCHES_SOURCES = False
+# The feed a job authenticates npm to before its first install, or nothing for
+# a kind that builds no workspace.
+FEED_SCRIPT_REGISTRY = "https://pkgs.dev.azure.com/genyume/the-test-cabinet/_packaging/the-test-cabinet/npm/registry/"
+NPM_FEED_SCRIPT = "scripts/ci/npm-feed.sh"
+NPM_INSTALL = "- script: npm ci"
+STEP = re.compile(r"^          - ", re.MULTILINE)
+PUBLISH_STAGE = "publish"
+PUBLISH_SCRIPT = "scripts/ci/publish-packages.sh"
+PUBLISH_WORKSPACE = "."
+FEED_REGISTRY = "https://pkgs.dev.azure.com/genyume/the-test-cabinet/_packaging/the-test-cabinet/npm/registry/"
+RELEASE_TAGS = "v*"
+BRANCHES = ("master", "staging", "nightly")
+TRIGGER = re.compile(r"^trigger:\n((?:  .*\n)+)", re.MULTILINE)
+PRUNE_SCRIPT = "scripts/ci/prune-target.sh"
+PRUNE_CONDITION = "succeededOrFailed()"
+BUILD_OUTPUT_CACHE = re.compile(
+    r"^          - task: Cache@2\n            displayName: Restore the build output\n(?:            .*\n)*?"
+    r"              path: (?P<path>\S+) *$",
+    re.MULTILINE,
+)
+
+GATE_RUN = re.compile(r"\bgate run((?: +[a-z0-9]+(?:-[a-z0-9]+)*)+)")
+GATE_SCRIPT = re.compile(r"ci/gates/([a-z0-9-]+)\\?\.py")
+HOOK_ID = re.compile(r"^ *- id: ([a-z0-9-]+) *$", re.MULTILINE)
+PRE_COMMIT_RUN = re.compile(r"\bpre-commit run ([a-z0-9][a-z0-9-]*)")
+STAGE = re.compile(r"^  - stage: ([a-z0-9-]+) *$", re.MULTILINE)
+JOB = re.compile(r"^      - (?:job|deployment): ([A-Za-z0-9_-]+) *$", re.MULTILINE)
+REPOSITORY_RESOURCE = re.compile(r"^    - repository: (?P<name>\S+) *$", re.MULTILINE)
+CONTAINER_RESOURCE = re.compile(r"^    - container: (?P<name>\S+) *$", re.MULTILINE)
+RESOURCE_KEY = re.compile(r"^      (?P<key>[a-z]+): (?P<value>.+?) *$", re.MULTILINE)
+
+
+def _named(text: str) -> set[str]:
+    """Every gate the text names, by `gate run` or by its script's path."""
+    ran = {gate_id for ids in GATE_RUN.findall(text) for gate_id in ids.split()}
+    return ran | set(GATE_SCRIPT.findall(text))
+
+
+def _sections(pattern: re.Pattern[str], text: str) -> dict[str, str]:
+    found = list(pattern.finditer(text))
+    ends = [match.start() for match in found[1:]] + [len(text)]
+    return {match.group(1): text[match.end() : end] for match, end in zip(found, ends, strict=True)}
+
+
+def _gates_jobs() -> dict[str, str]:
+    stages = _sections(STAGE, PIPELINE.read_text(encoding="utf-8"))
+    assert "gates" in stages, f"the pipeline has no gates stage; it has {sorted(stages)}"
+    return _sections(JOB, stages["gates"])
+
+
+def _gates_by_job() -> dict[str, list[str]]:
+    return {job: sorted(_named(steps)) for job, steps in _gates_jobs().items()}
+
+
+def _hook_ids() -> list[str]:
+    hooks = HOOK_ID.findall(CONFIG.read_text(encoding="utf-8"))
+    assert hooks, "no hook has an id, so this test is reading the configuration wrong"
+    return hooks
+
+
+def _misplaced(checks: Iterable[str], by_job: Mapping[str, list[str]]) -> dict[str, list[str]]:
+    checks = list(checks)
+    ran = Counter(check for steps in by_job.values() for check in steps)
+    return {
+        "given no step": sorted(check for check in checks if ran[check] == 0),
+        "given a step more than once": sorted(check for check in checks if ran[check] > 1),
+        "run but not a check": sorted(set(ran) - set(checks)),
+    }
+
+
+def _stages() -> dict[str, str]:
+    return _sections(STAGE, PIPELINE.read_text(encoding="utf-8"))
+
+
+def _expected_stages(*, mirror: bool) -> list[str]:
+    """The pipeline's stages in order: the gates, the image a kind builds, the publish and the mirror."""
+    return ["gates", *([IMAGE_STAGE] if BUILDS_IMAGE else []), PUBLISH_STAGE, *(["mirror"] if mirror else [])]
+
+
+def _resources(entry: re.Pattern[str]) -> dict[str, dict[str, str]]:
+    """Each resource of one kind the pipeline declares, with the keys written under it.
+
+    An entry's keys run up to the next entry of any kind, which is the next
+    line at the same indentation.
+    """
+    text = PIPELINE.read_text(encoding="utf-8")
+    resources = text[: text.index("\nstages:")]
+    found = list(entry.finditer(resources))
+    ends = []
+    for match in found:
+        following = re.search(r"^    - ", resources[match.end() :], re.MULTILINE)
+        ends.append(match.end() + following.start() if following else len(resources))
+    return {
+        match.group("name"): {
+            key.group("key"): key.group("value") for key in RESOURCE_KEY.finditer(resources[match.end() : end])
+        }
+        for match, end in zip(found, ends, strict=True)
+    }
+
+
+def _repository_resources() -> dict[str, dict[str, str]]:
+    return _resources(REPOSITORY_RESOURCE)
+
+
+def _container_resources() -> dict[str, dict[str, str]]:
+    return _resources(CONTAINER_RESOURCE)
+
+
+@pytest.mark.parametrize("caller", CALLERS)
+def test_a_caller_names_only_gates_that_exist(caller: str) -> None:
+    named = _named((ROOT / caller).read_text(encoding="utf-8"))
+    assert named, f"{caller} runs no gate, so this test is reading it wrong"
+    assert named <= GATE_IDS, f"{caller} names no such gate: {sorted(named - GATE_IDS)}"
+
+
+def test_every_hook_has_the_id_of_the_gate_it_runs() -> None:
+    hooks = re.findall(
+        r"- id: ([a-z0-9-]+)\n(?:(?! *- id: ).*\n)*? +entry: uv run --quiet --project ci "
+        r"(?:gate run |python ci/gates/)([a-z0-9-]+)",
+        CONFIG.read_text(encoding="utf-8"),
+    )
+    assert hooks, "no hook runs a gate, so this test is reading the configuration wrong"
+    assert [hook for hook, gate in hooks if hook != gate] == []
+
+
+def test_every_gate_has_a_hook_unless_it_is_pipeline_only() -> None:
+    hookless = GATE_IDS - set(_hook_ids())
+    assert hookless == PIPELINE_ONLY & GATE_IDS, (
+        f"these gates have no hook in {CONFIG.name} and are not named pipeline-only: "
+        f"{sorted(hookless - PIPELINE_ONLY)}; these are named pipeline-only yet have a hook: "
+        f"{sorted((PIPELINE_ONLY & GATE_IDS) - hookless)}"
+    )
+
+
+def test_the_gates_stage_runs_its_checks_on_the_checks_track_alone() -> None:
+    by_job = _gates_by_job()
+    running = sorted(job for job, gates in by_job.items() if gates)
+    assert running == sorted(TRACKS), f"the gates are spread over {running}, not the checks track alone"
+    assert "rust" not in by_job, "a kind carrying no crate has a Rust job"
+
+
+def test_a_gate_has_a_step_in_exactly_one_job_of_the_gates_stage() -> None:
+    assert _misplaced(GATE_IDS, _gates_by_job()) == {
+        "given no step": [],
+        "given a step more than once": [],
+        "run but not a check": [],
+    }
+
+
+def test_every_upstream_hook_has_a_step_in_exactly_one_job() -> None:
+    upstream = [hook for hook in _hook_ids() if hook not in GATE_IDS]
+    assert upstream, "no hook comes from an upstream repository, so this test is reading the configuration wrong"
+    by_job = {job: PRE_COMMIT_RUN.findall(steps) for job, steps in _gates_jobs().items()}
+    assert _misplaced(upstream, by_job) == {
+        "given no step": [],
+        "given a step more than once": [],
+        "run but not a check": [],
+    }
+
+
+def test_each_track_runs_in_the_superrepo_image_of_its_own() -> None:
+    """Each track runs in its image, pinned at a commit and pulled through the project's service connection."""
+    containers = _container_resources()
+    assert sorted(containers) == sorted(set(IMAGE_OF_TRACK.values())), f"the pipeline declares {sorted(containers)}"
+    for name, keys in containers.items():
+        assert keys.get("endpoint") == IMAGE_ENDPOINT, f"the {name} image is pulled through {keys.get('endpoint')!r}"
+        pin = IMAGE.match(keys.get("image", ""))
+        assert pin, f"the {name} image is pinned as {keys.get('image')!r}, which is not a superrepo image tag"
+        assert pin.group("image") == name, f"the {name} container names the {pin.group('image')} image"
+    tags = {IMAGE.match(keys["image"]).group(0).rsplit(":", 1)[1] for keys in containers.values()}
+    assert len(tags) == 1, f"the images are pinned at more than one commit: {sorted(tags)}"
+    jobs = _gates_jobs()
+    for track, image in IMAGE_OF_TRACK.items():
+        assert re.search(rf"^        container: {image} *$", jobs[track], re.MULTILINE), (
+            f"the {track} track does not run in the {image} image"
+        )
+    assert "vmImage: ubuntu-24.04" in PIPELINE.read_text(encoding="utf-8")
+
+
+def test_every_declared_repository_is_an_azure_one_on_master() -> None:
+    for name, keys in _repository_resources().items():
+        assert keys.get("type") == "git", f"{name} is declared as {keys.get('type')!r}, not a git repository"
+        assert keys.get("name") == f"{AZURE_PROJECT}/{name}", f"{name} is declared as {keys.get('name')!r}"
+        assert keys.get("ref") == "master", f"{name} is pinned to {keys.get('ref')!r}, not master"
+
+
+def _uses(job: str) -> list[str]:
+    """The repositories a job says it uses, ahead of its steps."""
+    return re.findall(r"^            - ([a-z0-9.-]+) *$", job[: job.index("steps:")], re.MULTILINE)
+
+
+def _checkouts(job: str) -> dict[str, str]:
+    """Each repository a job checks out, to the path it names, or `""` for none."""
+    found = {}
+    for match in CHECKOUT.finditer(job):
+        path = re.search(r"^            path: (\S+) *$", match.group("keys"), re.MULTILINE)
+        found[match.group("name")] = path.group(1) if path else ""
+    return found
+
+
+def _all_jobs() -> dict[str, str]:
+    """Every job of every stage, by stage and job."""
+    return {f"{stage}/{job}": steps for stage, text in _stages().items() for job, steps in _sections(JOB, text).items()}
+
+
+def test_a_pipeline_without_a_rust_job_fetches_nothing() -> None:
+    """A kind carrying no crate builds none, so it rewrites no source and declares only what its checks job reads.
+
+    The checks job uses every repository the pipeline declares, which scopes
+    its token to read each one.
+    """
+    declared = sorted(_repository_resources())
+    assert declared == sorted(CHECKS_CHECKOUTS), f"the pipeline declares {declared}, not {sorted(CHECKS_CHECKOUTS)}"
+    used = sorted(_uses(_gates_jobs()["checks"]))
+    assert used == declared, f"the checks job uses {used} and the pipeline declares {declared}"
+    assert "- script: scripts/ci/git-sources.sh" not in PIPELINE.read_text(encoding="utf-8")
+
+
+def test_the_checks_job_checks_out_each_data_repository_beside_this_one() -> None:
+    """Each repository the tests read across a data edge is checked out beside this one and named by its variable.
+
+    A second checkout puts every repository at its name under the sources
+    directory, so `<this repository>/../<data repository>` reaches it as in the
+    superrepo; a lone checkout keeps the sources directory as this
+    repository's own.
+    """
+    checks = _gates_jobs()["checks"]
+    checkouts = _checkouts(checks)
+    if not CHECKS_CHECKOUTS:
+        assert checkouts == {"self": ""}, f"the checks job checks out {checkouts}, not this repository alone"
+        assert "        variables:\n" not in checks[: checks.index("steps:")], "the checks job names a data checkout"
+        return
+    expected = {"self": f"s/{CHECKS_DIR}", **{repo: f"s/{repo}" for repo in CHECKS_CHECKOUTS}}
+    assert checkouts == expected, f"the checks job checks out {checkouts}, not {expected}"
+    assert list(checkouts) == list(expected), "the checks job does not check this repository out first"
+    head = checks[: checks.index("steps:")]
+    for repo, variable in CHECKS_CHECKOUTS.items():
+        assert re.search(rf"^          {variable}: {re.escape(SOURCES)}/{repo} *$", head, re.MULTILINE), (
+            f"the checks job does not name the {repo} checkout to the tests as {variable}"
+        )
+
+
+def test_every_checks_step_runs_in_this_repositorys_checkout() -> None:
+    """Every script of the checks job runs where this repository is checked out, and publishes from there."""
+    checks = _gates_jobs()["checks"]
+    starts = [match.start() for match in STEP.finditer(checks)]
+    scripts = [_step_at(checks, at) for at in starts if checks.startswith("          - script:", at)]
+    assert scripts, "the checks job runs no script"
+    workdir = f"            workingDirectory: {CHECKS_ROOT}\n"
+    for step in scripts:
+        if CHECKS_DIR:
+            assert workdir in step, f"a step of the checks job runs outside {CHECKS_ROOT}:\n{step}"
+        else:
+            assert "workingDirectory:" not in step, f"a step of the checks job names a directory:\n{step}"
+    for results in re.findall(r"^              testResultsFiles: (\S+) *$", checks, re.MULTILINE):
+        assert results.startswith(f"{CHECKS_ROOT}/target/"), f"the checks job publishes {results}, outside its checkout"
+
+
+def test_no_other_job_checks_out_a_data_repository() -> None:
+    """The gates' jobs alone check a data repository out, each held above; every other job checks out itself."""
+    for job, steps in _all_jobs().items():
+        if job in ("gates/rust", "gates/checks"):
+            continue
+        checkouts = _checkouts(steps)
+        assert set(checkouts) <= {"self"}, f"the {job} job checks out {sorted(checkouts)}"
+        assert "path:" not in "".join(match.group("keys") for match in CHECKOUT.finditer(steps)), (
+            f"the {job} job checks this repository out away from the sources directory"
+        )
+
+
+def test_the_checks_track_installs_the_npm_workspace_first() -> None:
+    """The prose gates run out of the npm workspace; the tools themselves come with the image."""
+    checks = _gates_jobs()["checks"]
+    install = checks.find("- script: npm ci")
+    assert install >= 0, "the checks track never installs the npm workspace"
+    first_gate = min(position for position in (checks.find("gate run"), checks.find("pre-commit run")) if position >= 0)
+    assert first_gate > install, "the checks track runs a check before the npm workspace is installed"
+
+
+def _step_at(steps: str, position: int) -> str:
+    """The step that starts at the position, up to the next step of the job."""
+    following = STEP.search(steps, position + 1)
+    return steps[position : following.start() if following else len(steps)]
+
+
+def test_every_npm_install_is_authenticated_to_the_feed_first() -> None:
+    """The token reaches npm through the user's configuration, written by the kit's script before the install."""
+    jobs = _gates_jobs()
+    if not FEED_SCRIPT_REGISTRY:
+        assert NPM_FEED_SCRIPT not in PIPELINE.read_text(encoding="utf-8"), (
+            "the pipeline authenticates to the package feed, which this repository's kind never installs from"
+        )
+        return
+    installing = {job: steps for job, steps in jobs.items() if NPM_INSTALL in steps}
+    assert "checks" in installing, "the checks track never installs the npm workspace"
+    for job, steps in installing.items():
+        authenticate = f"- script: {NPM_FEED_SCRIPT} {FEED_SCRIPT_REGISTRY}\n"
+        times = steps.count(authenticate)
+        assert times == 1, f"the {job} track authenticates to the feed {times} times"
+        position = steps.index(authenticate)
+        assert position < steps.index(NPM_INSTALL), f"the {job} track installs before it authenticates to the feed"
+        step = _step_at(steps, steps.rindex("\n", 0, position) + 1)
+        assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in step, f"the {job} track's feed step is given no token"
+    for job, steps in jobs.items():
+        if job not in installing:
+            assert NPM_FEED_SCRIPT not in steps, f"the {job} track authenticates to the feed but installs nothing"
+
+
+def _trigger() -> str:
+    found = TRIGGER.search(PIPELINE.read_text(encoding="utf-8"))
+    assert found, "the pipeline has no trigger"
+    return found.group(1)
+
+
+def test_a_tag_runs_the_pipeline() -> None:
+    tags = f"  tags:\n    include:\n      - {RELEASE_TAGS}\n"
+    trigger = _trigger()
+    branches = "".join(f"      - {branch}\n" for branch in BRANCHES)
+    included = f"  branches:\n    include:\n{branches}  tags:"
+    assert included in trigger, f"a push to one of {BRANCHES} does not run the pipeline"
+    assert tags in trigger, f"a push of a tag {RELEASE_TAGS} does not run the pipeline, so nothing is published"
+
+
+def test_a_tag_publishes_the_public_packages_after_the_gates() -> None:
+    """The publish stage runs the kit's script for a tag once every gate passed, and runs no gate itself."""
+    stages = _stages()
+    assert PUBLISH_STAGE in stages, f"the pipeline has no {PUBLISH_STAGE} stage; it has {sorted(stages)}"
+    publish = stages[PUBLISH_STAGE]
+    assert "dependsOn: gates" in publish
+    assert "succeeded()" in publish
+    assert "startsWith(variables['Build.SourceBranch'], 'refs/tags/v')" in publish, "the stage runs for more than a tag"
+    assert _named(publish) == set(), f"the stage runs gates: {sorted(_named(publish))}"
+    assert re.search(r"^        container: web *$", publish, re.MULTILINE), "the stage does not run in the web image"
+    command = f"- script: {PUBLISH_SCRIPT} {PUBLISH_WORKSPACE} {FEED_REGISTRY} $(Build.SourceBranch)\n"
+    assert publish.count(command) == 1, "the stage does not run the script once with the workspace, feed and tag"
+    step = _step_at(publish, publish.rindex("\n", 0, publish.index(command)) + 1)
+    assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in step, "the publish is given no token"
+
+
+def _include_at(text: str, template: str, indent: int) -> tuple[int, dict[str, str]]:
+    """Where the text includes the template, and the parameters it hands over there."""
+    pad = " " * indent
+    found = list(re.finditer(rf"^{pad}- template: {re.escape(template)} *\n{pad}  parameters:\n", text, re.MULTILINE))
+    assert len(found) == 1, f"the pipeline includes {template} {len(found)} times"
+    handed = {}
+    for line in text[found[0].end() :].splitlines():
+        given = re.fullmatch(rf"{pad}    (?P<key>[A-Za-z0-9]+): (?P<value>\S+) *", line)
+        if not given:
+            break
+        handed[given.group("key")] = given.group("value")
+    return found[0].start(), handed
+
+
+def _declared_parameters(path: Path) -> list[str]:
+    """The parameters a template declares, under its top-level `parameters:` list."""
+    text = path.read_text(encoding="utf-8")
+    block = re.search(r"^parameters:\n((?:(?:  .*|)\n)*)", text, re.MULTILINE)
+    return re.findall(r"^  - name: ([A-Za-z0-9]+) *$", block.group(1), re.MULTILINE) if block else []
+
+
+def test_the_pipeline_hands_its_own_templates_what_it_runs_in() -> None:
+    """Each template is handed the Rust image the track pins, the registry, its connection and the arm64 pool."""
+    pipeline = PIPELINE.read_text(encoding="utf-8")
+    containers = _container_resources()
+    for template, indent in ((PROJECT_JOBS, 6), (PROJECT_STAGES_FILE, 2)):
+        _, handed = _include_at(pipeline, template, indent)
+        assert handed == PROJECT_PARAMETERS, f"{template} is handed {handed}"
+        if "rustImage" in handed:
+            rust = containers[IMAGE_OF_TRACK["rust"]]["image"]
+            assert handed["rustImage"] == rust, f"{template} is handed another Rust image than the track's"
+        assert handed["registryEndpoint"] == IMAGE_ENDPOINT
+        path = ROOT / template
+        assert path.is_file(), f"the pipeline includes {template}, which the repository does not hold"
+        declared = _declared_parameters(path)
+        assert sorted(declared) == sorted(handed), (
+            f"{template} declares the parameters {sorted(declared)} and is handed {sorted(handed)}; "
+            "Azure Pipelines refuses a parameter a template does not declare"
+        )
+
+
+def test_the_repositorys_own_jobs_are_in_the_gates_stage() -> None:
+    stages = _stages()
+    _include_at(stages["gates"], PROJECT_JOBS, 6)
+    assert _named((ROOT / PROJECT_JOBS).read_text(encoding="utf-8")) == set(), (
+        f"{PROJECT_JOBS} runs a gate, which the kit gives a step of its own"
+    )
+
+
+def _depends_on(stage: str) -> list[str]:
+    inline = re.search(r"^    dependsOn: *(\S+) *$", stage, re.MULTILINE)
+    if inline:
+        return [inline.group(1)]
+    listed = re.search(r"^    dependsOn: *\n((?:      - .*\n)+)", stage, re.MULTILINE)
+    return re.findall(r"^      - (\S+) *$", listed.group(1), re.MULTILINE) if listed else []
+
+
+def test_the_repositorys_own_stages_follow_the_gates_and_run_no_gate() -> None:
+    """The stages are included after the publish, are the ones named, and each waits for the gates.
+
+    A stage that names no `dependsOn` would depend on the stage before it, the
+    publish, which a branch's run skips.
+    """
+    stages = _stages()
+    _include_at(stages[PUBLISH_STAGE], PROJECT_STAGES_FILE, 2)
+    text = (ROOT / PROJECT_STAGES_FILE).read_text(encoding="utf-8")
+    own = _sections(STAGE, text)
+    assert list(own) == PROJECT_STAGES, f"{PROJECT_STAGES_FILE} declares the stages {list(own)}, not {PROJECT_STAGES}"
+    for stage, body in own.items():
+        assert "gates" in _depends_on(body), f"the {stage} stage does not depend on the gates"
+    assert _named(text) == set(), f"{PROJECT_STAGES_FILE} runs a gate, which the kit gives a step of its own"
+
+
+def test_the_mirror_stage_pushes_the_gated_refs_last() -> None:
+    stages = _stages()
+    assert list(stages) == _expected_stages(mirror=True), f"the pipeline's stages are {list(stages)}"
+    mirror = stages[MIRROR_STAGE]
+    assert "      - gates\n      - publish\n" in mirror, "the stage does not wait for the gates and the publish"
+    assert "eq(dependencies.gates.result, 'Succeeded')" in mirror, "the stage runs after a failed gate"
+    assert "in(dependencies.publish.result, 'Succeeded', 'Skipped')" in mirror, "the stage runs after a failed publish"
+    for stage in PROJECT_STAGES:
+        assert f"      - {stage}\n" in mirror[: mirror.index("condition:")], f"the stage does not wait for {stage}"
+        assert f"in(dependencies.{stage}.result, 'Succeeded', 'Skipped')" in mirror, (
+            f"the stage runs after a failed {stage} stage"
+        )
+    branches = ", ".join(f"'refs/heads/{branch}'" for branch in BRANCHES)
+    assert f"in(variables['Build.SourceBranch'], {branches})" in mirror, "the stage is not held to the branches"
+    assert "startsWith(variables['Build.SourceBranch'], 'refs/tags/v')" in mirror, "a tag is never mirrored"
+    assert "fetchDepth: 0" in mirror, "a shallow checkout cannot be pushed"
+    assert f"secureFile: {MIRROR_KEY}\n" in mirror, f"the stage does not fetch the {MIRROR_KEY} deploy key"
+    assert f"{MIRROR_SCRIPT} --url '{MIRROR_URL}'" in mirror, "the push does not name this repository's mirror"
+    assert '"$(mirrorKey.secureFilePath)" "$(Build.SourceBranch)"' in mirror, "the push is given no key or ref"
+    assert _named(mirror) == set(), f"the stage runs gates: {sorted(_named(mirror))}"
+    assert (ROOT / MIRROR_SCRIPT).is_file(), f"the pipeline runs {MIRROR_SCRIPT}, which the repository does not hold"
+
+
+def _image_jobs() -> dict[str, str]:
+    stages = _stages()
+    assert IMAGE_STAGE in stages, f"the pipeline has no {IMAGE_STAGE} stage; it has {sorted(stages)}"
+    return _sections(JOB, stages[IMAGE_STAGE])
+
+
+def test_the_image_is_built_by_a_kind_that_builds_one_alone() -> None:
+    """A kind that builds an image has its stage, its scripts, its Dockerfile and its gate; any other has none."""
+    pipeline = PIPELINE.read_text(encoding="utf-8")
+    should = "is missing" if BUILDS_IMAGE else "is here, though this repository builds no image"
+    assert (IMAGE_STAGE in _stages()) is BUILDS_IMAGE, f"the {IMAGE_STAGE} stage {should}"
+    assert (IMAGE_SCRIPT in pipeline) is BUILDS_IMAGE, f"the step running {IMAGE_SCRIPT} {should}"
+    assert (MANIFEST_SCRIPT in pipeline) is BUILDS_IMAGE, f"the step running {MANIFEST_SCRIPT} {should}"
+    assert (BUILD_CONTEXT_GATE in GATE_IDS) is BUILDS_IMAGE, f"the {BUILD_CONTEXT_GATE} gate {should}"
+    for path in ("Dockerfile", ".dockerignore", IMAGE_SCRIPT, MANIFEST_SCRIPT, "scripts/ci/build-context.sh"):
+        assert (ROOT / path).is_file() is BUILDS_IMAGE, f"{path} {should}"
+
+
+def test_the_build_context_gate_runs_in_the_checks_job() -> None:
+    if not BUILDS_IMAGE:
+        pytest.skip("this repository builds no image")
+    assert BUILD_CONTEXT_GATE in _gates_by_job()["checks"], f"the checks job does not run {BUILD_CONTEXT_GATE}"
+    assert BUILD_CONTEXT_GATE in _hook_ids(), f"{BUILD_CONTEXT_GATE} has no hook, though it finishes in moments"
+
+
+def test_the_image_stage_builds_after_the_gates_on_master_and_staging() -> None:
+    if not BUILDS_IMAGE:
+        pytest.skip("this repository builds no image")
+    stage = _stages()[IMAGE_STAGE]
+    assert "    dependsOn: gates\n" in stage, "the image stage does not wait for the gates"
+    branches = ", ".join(f"'refs/heads/{branch}'" for branch in IMAGE_BRANCHES)
+    assert f"condition: and(succeeded(), in(variables['Build.SourceBranch'], {branches}))" in stage, (
+        f"the image stage is not held to {IMAGE_BRANCHES} after the gates passed"
+    )
+    assert _named(stage) == set(), f"the image stage runs gates: {sorted(_named(stage))}"
+    publish = _stages()[PUBLISH_STAGE]
+    assert "dependsOn: gates\n" in publish, "the publish stage waits on more than the gates"
+
+
+def test_each_architecture_builds_natively_and_pushes_its_tag() -> None:
+    """One job per architecture, on its own pool, fetches as the Rust job does and pushes `<name>:<commit>-<arch>`."""
+    if not BUILDS_IMAGE:
+        pytest.skip("this repository builds no image")
+    jobs = _image_jobs()
+    assert sorted(jobs) == sorted([*(f"{IMAGE_STAGE}_{arch}" for arch in IMAGE_POOLS), f"{IMAGE_STAGE}_manifest"])
+    for arch, pool in IMAGE_POOLS.items():
+        job = jobs[f"{IMAGE_STAGE}_{arch}"]
+        assert f"        pool:\n          {pool}\n" in job, f"the {arch} image is not built on {pool!r}"
+        assert "container:" not in job, f"the {arch} image is built inside a container, with no daemon to build on"
+        assert sorted(_uses(job)) == sorted(FETCHED), f"the {arch} image job uses {sorted(_uses(job))}"
+        sources = job.find(f"- script: {GIT_SOURCES_SCRIPT}\n")
+        login = job.find("- task: Docker@2\n")
+        build = job.find(f'- script: {IMAGE_SCRIPT} {IMAGE_NAME} "$(Build.SourceVersion)"\n')
+        if FETCHES_SOURCES:
+            assert 0 <= sources < login < build, f"the {arch} job does not rewrite the sources, log in, then build"
+            assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in _step_at(job, job.rindex("\n", 0, sources) + 1)
+        else:
+            assert sources < 0, f"the {arch} job rewrites the sources of a build that fetches no repository"
+            assert 0 <= login < build, f"the {arch} job does not log in, then build"
+        if FEED_SCRIPT_REGISTRY:
+            # The build is handed npm's configuration as a secret, so it is written first.
+            feed = job.find(f"- script: {NPM_FEED_SCRIPT} {FEED_SCRIPT_REGISTRY}\n")
+            assert 0 <= feed < build, f"the {arch} job does not authenticate npm to the feed before it builds"
+            step = _step_at(job, job.rindex("\n", 0, feed) + 1)
+            assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in step, f"the {arch} job's feed step has no token"
+        else:
+            assert NPM_FEED_SCRIPT not in job, f"the {arch} job authenticates to a feed its kind never installs from"
+        assert f"containerRegistry: {IMAGE_ENDPOINT}\n" in _step_at(job, job.rindex("\n", 0, login) + 1)
+    assert (ROOT / IMAGE_SCRIPT).is_file(), f"the pipeline runs {IMAGE_SCRIPT}, which the repository does not hold"
+    assert (ROOT / GIT_SOURCES_SCRIPT).is_file() is FETCHES_SOURCES
+
+
+def test_the_manifest_job_fuses_the_architectures_last() -> None:
+    if not BUILDS_IMAGE:
+        pytest.skip("this repository builds no image")
+    job = _image_jobs()[f"{IMAGE_STAGE}_manifest"]
+    needs = "".join(f"          - {IMAGE_STAGE}_{arch}\n" for arch in IMAGE_POOLS)
+    assert f"        dependsOn:\n{needs}" in job, "the manifest job does not wait for every architecture"
+    login = job.find("- task: Docker@2\n")
+    fuse = job.find(f'- script: {MANIFEST_SCRIPT} "$(Build.SourceVersion)" {IMAGE_NAME}\n')
+    assert 0 <= login < fuse, "the manifest job does not log in and then fuse this repository's image"
+    assert f"containerRegistry: {IMAGE_ENDPOINT}\n" in _step_at(job, job.rindex("\n", 0, login) + 1)
+    assert (ROOT / MANIFEST_SCRIPT).is_file(), f"the pipeline runs {MANIFEST_SCRIPT}, which is not here"
