@@ -16,7 +16,7 @@
   "dependencies": {
     "@clockwyrks/backend-api": "0.2.4",
     "@clockwyrks/run-record": "0.2.4",
-    "@clockwyrks/ui": "0.1.1",
+    "@clockwyrks/ui": "0.1.2",
     "@observablehq/plot": "^0.6.16",
     "@react-three/fiber": "^9.6.1",
     "react": "^19.1.0",
