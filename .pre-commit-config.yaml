@@ -28,7 +28,10 @@ repos:
         exclude: '(^|/)tsconfig(\.[^/]+)?\.json$'
       - id: check-merge-conflict
       - id: end-of-file-fixer
-        exclude: '\.(svg|png|ico|woff2?)$'
+        # ESLint writes the lint ratchet's baseline, `eslint-suppressions.json`,
+        # without a final newline and rewrites it on every prune, so it is left
+        # alone, as the binary assets are.
+        exclude: '\.(svg|png|ico|woff2?)$|^eslint-suppressions\.json$'
       - id: check-shebang-scripts-are-executable
         exclude: '\.rs$'
       - id: check-symlinks

@@ -99,7 +99,8 @@ check_equal "no snapshot URL is refused" "1" "$?"
 check_contains "naming it" "TCAB_SNAPSHOT_URL must be set" "$out"
 check_equal "before anything is built" "" "$(cat "$tmp/calls.log")"
 
-# What an undefined pipeline variable reaches a step as.
+# What an undefined pipeline variable reaches a step as: the macro, unexpanded.
+# shellcheck disable=SC2016
 out="$(SNAPSHOT='$(TCAB_SNAPSHOT_URL_MASTER)' run master)"
 check_equal "an undefined pipeline variable is refused" "1" "$?"
 check_contains "naming the value" "TCAB_SNAPSHOT_URL is not an http(s) URL: '\$(TCAB_SNAPSHOT_URL_MASTER)'" "$out"
