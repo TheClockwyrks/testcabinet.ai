@@ -1,0 +1,34 @@
+# The tcab.ai share-link Worker, deployed by scripts/ci/deploy-workers.sh with
+# `wrangler deploy --env <environment>`. The Public Gallery deployment page of
+# the documentation site, sections "The Workers" and "DNS and TLS", states its
+# binding, its variable and its hostname; "Staging" states the staging names.
+#
+# The hostname is a Worker custom domain, so the deploy creates its proxied
+# record and Cloudflare issues its certificate. Bindings and variables are not
+# inherited by an environment, so each states its own. The top level is what
+# `wrangler dev` runs against, a local bucket.
+name = "tcab-share-links-dev"
+main = "src/worker.ts"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+r2_buckets = [{ binding = "SNAPSHOT", bucket_name = "tcab-snapshot-dev" }]
+
+[vars]
+GALLERY_ORIGIN = "http://localhost:1430"
+
+[env.production]
+name = "tcab-share-links"
+routes = [{ pattern = "tcab.ai", custom_domain = true }]
+r2_buckets = [{ binding = "SNAPSHOT", bucket_name = "tcab-snapshot" }]
+
+[env.production.vars]
+GALLERY_ORIGIN = "https://testcabinet.ai"
+
+[env.staging]
+name = "tcab-share-links-staging"
+routes = [{ pattern = "staging.tcab.ai", custom_domain = true }]
+r2_buckets = [{ binding = "SNAPSHOT", bucket_name = "tcab-snapshot-staging" }]
+
+[env.staging.vars]
+GALLERY_ORIGIN = "https://staging.testcabinet.ai"

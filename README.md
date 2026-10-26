@@ -71,6 +71,30 @@ installed. Without one it fails, naming what it looked for.
 One gate beside the kit's is this repository's own: `web-lint`, ESLint over
 the gallery's sources, its build configuration and its tools.
 
+## The Workers
+
+Two Workers stand beside the gallery, each an npm workspace member with its
+own `wrangler.toml`. The Serving page of the documentation site,
+`apps/docs/src/content/docs/components/site/serving.md`, states what each
+answers, and the Public gallery deployment page its bindings, variables and
+routes.
+
+- `apps/preview-tags` is routed on the gallery's run routes. It writes a
+  published run's title, description and image into the Pages shell's head,
+  and answers an unknown run id with the shell and a 404.
+- `apps/share-links` is `tcab.ai`. It redirects `/r/<code>` to a run's
+  verdict page and `/p/<code>` to its play page, reading the run id from the
+  bucket's `codes/<code>`.
+
+Each imports nothing outside its own sources, so `wrangler` bundles it
+without an install. Its suite runs its handler in Node with the bucket
+binding stubbed, as `npm test` runs every member's:
+
+```sh
+npm test -w apps/preview-tags
+npx wrangler@4.40.3 dev --config apps/share-links/wrangler.toml
+```
+
 ## Deploying
 
 The pipeline's `deploy` stage (`.azure/project/stages.yml`) runs
@@ -86,10 +110,11 @@ one. The superrepo's Releasing page,
 (Cloudflare Pages and Workers, one-time)", says how the projects and the
 pipeline's variables are set up.
 
-Two parts of the gallery the documentation describes are not here yet. The
+The same stage runs `scripts/ci/deploy-workers.sh`, which deploys both
+Workers with `wrangler deploy`: `master` their `production` environment and
+`staging` their `staging` one.
+
+One part of the gallery the documentation describes is not here yet. The
 shell still bakes the dataset into the bundle at build time, where the
 documentation has it read the bucket's index in the browser, so a published
-run appears on the site with the next deploy rather than without one. The two
-Workers deployed from this repository, the `tcab.ai` share links and the
-preview tags, are not here either; their `wrangler deploy` steps join the
-deploy stage with them.
+run appears on the site with the next deploy rather than without one.

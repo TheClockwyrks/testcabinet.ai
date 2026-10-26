@@ -5,6 +5,9 @@
 node_modules/
 dist/
 
+# The local state `wrangler dev` keeps beside a Worker's wrangler.toml.
+.wrangler/
+
 # Tool caches.
 .cspellcache
 __pycache__/

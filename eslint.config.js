@@ -48,6 +48,14 @@ import tseslint from "typescript-eslint";
  */
 const PROJECTS = [
   { sources: "apps/site/src", tsconfig: "apps/site/tsconfig.json" },
+  {
+    sources: "apps/preview-tags/src",
+    tsconfig: "apps/preview-tags/tsconfig.json",
+  },
+  {
+    sources: "apps/share-links/src",
+    tsconfig: "apps/share-links/tsconfig.json",
+  },
 ];
 
 /** The sources the type-checked rules read, each inside a project of its own. */
@@ -72,6 +80,7 @@ const CONFIGS = [
   "apps/site/vite.config.ts",
   "apps/site/vite-plugin-*.ts",
   "apps/site/linked-checkouts*.ts",
+  "apps/*/vitest.config.ts",
 ];
 
 /**
