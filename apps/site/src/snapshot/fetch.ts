@@ -1,13 +1,12 @@
-// How the snapshot plugin reaches the public snapshot: one JSON document per
-// request, each request retried through transient failures, and many of them in
-// flight at once without changing the order their results are consumed in.
+// How the gallery reaches the public snapshot: one JSON document per request,
+// each request retried through transient failures, and many of them in flight at
+// once without changing the order their results are consumed in.
 //
-// A gallery build reads one document per published run, about a thousand of them
-// from a bucket the edge does not cache, so a single dropped connection is an
-// expected event rather than a sign of a broken snapshot. This module is what
-// keeps one from failing the build. It has no dependency beyond the platform's
-// `fetch` and timers, both injectable, so its tests run on fake timers with no
-// network.
+// A visitor's page reads the bucket over the open internet, so a dropped
+// connection or a passing 5xx from the edge is an expected event rather than a
+// sign of a broken snapshot. This module is what keeps one from failing the page.
+// It has no dependency beyond the platform's `fetch` and timers, both injectable,
+// so its tests run on fake timers with no network.
 
 /** The `fetch` this module needs: a URL and an abort signal in, a response out. */
 export type SnapshotFetch = (
@@ -21,9 +20,9 @@ export const DEFAULT_ATTEMPTS = 5;
 /**
  * How long one attempt may take, from the request to the last byte of the body.
  *
- * The largest snapshot document is tens of megabytes and a healthy transfer of it
- * takes a few seconds; a minute is far outside that and still leaves five
- * attempts inside a Cloudflare Pages build's twenty.
+ * The largest snapshot document, the gg corpus, is tens of megabytes, and a
+ * healthy transfer of it takes a few seconds on a home connection; a minute is
+ * far outside that.
  */
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 60_000;
 
@@ -31,40 +30,14 @@ export const DEFAULT_ATTEMPT_TIMEOUT_MS = 60_000;
 export const DEFAULT_BACKOFF_BASE_MS = 500;
 
 /** The longest wait between two attempts. */
-export const DEFAULT_BACKOFF_MAX_MS = 8_000;
+export const DEFAULT_BACKOFF_MAX_MS = 8000;
 
 /**
- * How many run documents are in flight at once.
- *
- * A document's cost is dominated by its round trip (about a quarter of a second
- * each when fetched one at a time), so the build time falls almost linearly with
- * this number until the bucket pushes back. Eight is close to what a browser
- * opens to one host: it turns four minutes into about half of one while staying
- * far below any rate the public bucket limits. It bounds the requests in flight
- * and nothing else: every document that was fetched is held until the build has
- * written its output.
+ * How many documents are in flight at once: the case files the catalog is built
+ * from are fetched this many at a time. Six is what a browser opens to one host
+ * over HTTP/1.1, and an HTTP/2 connection multiplexes them.
  */
-export const DEFAULT_CONCURRENCY = 8;
-
-/** The environment variable that overrides {@link DEFAULT_CONCURRENCY}. */
-export const CONCURRENCY_ENV = "TCAB_SNAPSHOT_CONCURRENCY";
-
-/**
- * The concurrency a build runs with: the variable's value when it is set, the
- * default otherwise. A set value that is not a positive integer is an error
- * rather than a silent fallback, since the build would otherwise run at a speed
- * nobody asked for.
- */
-export function resolveConcurrency(raw: string | undefined): number {
-  const value = raw?.trim();
-  if (value === undefined || value === "") return DEFAULT_CONCURRENCY;
-  if (!/^[1-9]\d*$/.test(value)) {
-    throw new Error(
-      `${CONCURRENCY_ENV} must be a positive integer, got "${value}"`,
-    );
-  }
-  return Number(value);
-}
+export const DEFAULT_CONCURRENCY = 6;
 
 /** A response whose status is not a success. */
 class HttpStatusError extends Error {
@@ -96,8 +69,8 @@ class AttemptTimeoutError extends Error {
 /**
  * A document that could not be fetched, after every attempt it was owed.
  *
- * The message names the URL and the number of attempts, which is what a failed
- * build prints. `status` is the HTTP status of the last attempt when the server
+ * The message names the URL and the number of attempts, which is what a page
+ * that could not read the snapshot reports. `status` is the HTTP status of the last attempt when the server
  * answered at all, so a caller can tell an absent object (404) from a failure.
  */
 export class SnapshotFetchError extends Error {
@@ -117,7 +90,7 @@ export class SnapshotFetchError extends Error {
   }
 }
 
-/** An error's message, with its cause's: undici reports the reason only there. */
+/** An error's message, with its cause's: a transport may report the reason only there. */
 function describe(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
   const cause: unknown = error.cause;
@@ -138,15 +111,14 @@ function describe(error: unknown): string {
  * A status the server chose deliberately (a 404 above all) and a body that is
  * not JSON are answers, and asking again returns the same one. Everything else
  * is transient: a timeout, the statuses a server or proxy uses to say "not now"
- * (408, 429 and every 5xx), and any failure of the transport itself, including
- * the bare "terminated" undici raises when a connection drops mid-body.
+ * (408, 429 and every 5xx), and any failure of the transport itself, such as
+ * the "Failed to fetch" a browser raises when a connection drops mid-body.
  */
 function isTransient(error: unknown): boolean {
   if (error instanceof MalformedBodyError) return false;
-  if (error instanceof HttpStatusError) {
-    return error.status === 408 || error.status === 429 || error.status >= 500;
-  }
-  return true;
+  return error instanceof HttpStatusError
+    ? error.status === 408 || error.status === 429 || error.status >= 500
+    : true;
 }
 
 export interface SnapshotFetcherOptions {
@@ -206,13 +178,13 @@ export function createSnapshotFetcher(
       const response = await fetchImpl(url, { signal: controller.signal });
       if (!response.ok) {
         // Release the connection; the body of an error is of no use here.
-        void response.body?.cancel().catch(() => undefined);
+        void response.body?.cancel().catch(() => {});
         throw new HttpStatusError(response.status, response.statusText);
       }
       return await response.text();
     })();
     // The loser of the race may still reject after the winner settled it.
-    body.catch(() => undefined);
+    body.catch(() => {});
     let text: string;
     try {
       text = await Promise.race([body, deadline]);

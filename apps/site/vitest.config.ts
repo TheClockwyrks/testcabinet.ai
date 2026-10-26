@@ -1,9 +1,8 @@
 import { defineConfig } from "vitest/config";
 
 /**
- * The suite of the build-time plugins, which run in Node beside the Vite config,
- * of the development server's helpers and of the reader of the static files the
- * plugins write.
+ * The suite of the gallery's reader of the published snapshot, which runs in
+ * Node against a scripted bucket, and of the development server's helpers.
  *
  * It is a config of its own so that the tests do not load `vite.config.ts`,
  * whose plugins would read the environment and the runs directory. The gallery

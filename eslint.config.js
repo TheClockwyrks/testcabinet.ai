@@ -72,8 +72,8 @@ const TESTS = PROJECTS.flatMap(({ sources }) => [
  *
  * They are linted without the type-checked rules because a build's
  * configuration is not a member of the project it configures. A module a
- * configuration loads (the gallery's two Vite plugins and the development
- * server's linked checkouts) is part of that configuration.
+ * configuration loads (the development server's local-runs plugin and its
+ * linked checkouts) is part of that configuration.
  */
 const CONFIGS = [
   "eslint.config.js",

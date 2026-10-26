@@ -43,18 +43,23 @@ to its sibling checkout instead.
 ```sh
 npm ci
 npm run dev                 # the development server
-npm run build               # the static bundle, into apps/site/dist
-npm test                    # the build plugins' and the file reader's suite
+npm run build               # the static shell, into apps/site/dist
+npm test                    # the snapshot reader's and the dev helpers' suite
 npm run lint                # ESLint, with the ratchet in eslint-suppressions.json
 npm run screenshot -- / tmp/screenshots/index.png
 npm run capture-backdrop    # bake the backdrop's stills into ui-common
 ```
 
-The build fetches the published dataset from the public bucket's read URL in
-`TCAB_SNAPSHOT_URL` and bakes it into the bundle, writing each run's and each
-case's files beside it; with the variable unset it builds an empty gallery. The
-variable is read from the environment or from a gitignored `apps/site/.env.site`
-(`apps/site/.env.site.example` is its template), the environment winning.
+The build bakes in nothing of the published dataset. The page reads it from
+the public bucket in the browser (`apps/site/src/snapshot/`): `index.json` and
+what it names when it loads, a run's document when a page of the run opens, so
+a published run appears without a build. The build takes only the bucket's
+public base, `TCAB_SNAPSHOT_URL`, and writes it into the page; with the variable
+unset the gallery reads nothing and renders its empty states. The variable is
+read from the environment or from a gitignored `apps/site/.env.site`
+(`apps/site/.env.site.example` is its template), the environment winning. The
+bucket answers the page across origins, so a development server reading a real
+bucket needs that bucket's CORS policy to admit its origin.
 
 In the development server only, the gallery also lists the runs produced on
 this machine but not published, read from the directory `TTC_RUNS_DIR` names,
@@ -104,8 +109,8 @@ the gates: `master` deploys to the Cloudflare Pages project
 `the-test-cabinet-staging`, served at `staging.testcabinet.ai`. Each build is
 handed its environment's `TCAB_SNAPSHOT_URL`, from the pipeline definition's
 `TCAB_SNAPSHOT_URL_MASTER` and `TCAB_SNAPSHOT_URL_STAGING`, and the script
-refuses to build without one, since an empty gallery would replace the live
-one. The superrepo's Releasing page,
+refuses to build without one, since a gallery reading no bucket would replace
+the live one. The superrepo's Releasing page,
 `apps/docs/src/content/docs/development/releasing.md`, section "Gallery
 (Cloudflare Pages and Workers, one-time)", says how the projects and the
 pipeline's variables are set up.
@@ -113,8 +118,3 @@ pipeline's variables are set up.
 The same stage runs `scripts/ci/deploy-workers.sh`, which deploys both
 Workers with `wrangler deploy`: `master` their `production` environment and
 `staging` their `staging` one.
-
-One part of the gallery the documentation describes is not here yet. The
-shell still bakes the dataset into the bundle at build time, where the
-documentation has it read the bucket's index in the browser, so a published
-run appears on the site with the next deploy rather than without one.

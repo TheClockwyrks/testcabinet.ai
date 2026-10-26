@@ -5,17 +5,17 @@ import { defineConfig, searchForWorkspaceRoot } from "vite";
 import react from "@vitejs/plugin-react";
 import { linkedCheckouts } from "./linked-checkouts";
 import { localRuns } from "./vite-plugin-local-runs";
-import { snapshot } from "./vite-plugin-snapshot";
 
-// Static gallery site. No backend: `vite build` emits a fully static bundle.
+// Static gallery site. No backend: `vite build` emits a static shell.
 //
-// The published dataset is the backend's public R2 snapshot. The `snapshot`
-// plugin fetches it once at *build* time (from `TCAB_SNAPSHOT_URL`) and inlines
-// it into the bundle, so the shipped output is fully static with no live
-// dependency on the backend or R2.
+// The published dataset is the backend's public snapshot, a bucket the page
+// reads in the browser at runtime (see `src/snapshot/reader.ts`), so the build
+// bakes none of it in and a publish needs no build. The one thing the build
+// takes from it is where it is: `TCAB_SNAPSHOT_URL`, the bucket's public base,
+// written into the page as `import.meta.env.TCAB_SNAPSHOT_URL`.
 
-// Load `.env.site` (if present) into `process.env` before the snapshot plugin
-// reads `TCAB_SNAPSHOT_URL`. We avoid a dependency on the `dotenv` package: this
+// Load `.env.site` (if present) into `process.env` before the config reads
+// `TCAB_SNAPSHOT_URL`. We avoid a dependency on the `dotenv` package: this
 // parses only simple `KEY=VALUE` lines, skips blanks and `#` comments, strips
 // surrounding single/double quotes, and never clobbers a variable already set
 // in the environment (so a shell export still wins). The deploy pipeline sets
@@ -52,6 +52,13 @@ function loadEnvSite(projectRoot: string): void {
 const here = dirname(fileURLToPath(import.meta.url));
 loadEnvSite(here);
 const runsDir = process.env.TTC_RUNS_DIR ?? resolve(here, "../../../runs");
+
+// The bucket's public base, without a trailing slash. Unset, the gallery reads
+// nothing and renders the empty states, which is what a development server with
+// no `.env.site` shows; the deploy refuses to build without one.
+const snapshotUrl = (process.env.TCAB_SNAPSHOT_URL ?? "")
+  .trim()
+  .replace(/\/+$/, "");
 
 /**
  * The bare specifiers `@clockwyrks/ui`'s `dist/` imports, other than the
@@ -116,7 +123,10 @@ const UI_PREBUNDLED = [
 const LINKED_PREBUNDLED = ["three"];
 
 export default defineConfig({
-  plugins: [react(), snapshot(), localRuns({ runsDir })],
+  plugins: [react(), localRuns({ runsDir })],
+  define: {
+    "import.meta.env.TCAB_SNAPSHOT_URL": JSON.stringify(snapshotUrl),
+  },
   resolve: { dedupe: LINKED_PREBUNDLED },
   optimizeDeps: {
     // The gallery's page alone. Left to itself the dependency scan crawls every

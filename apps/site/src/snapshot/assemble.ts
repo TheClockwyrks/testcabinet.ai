@@ -1,73 +1,31 @@
 import type { RunSummary } from "@clockwyrks/backend-api/snapshot";
-import type { Plugin } from "vite";
 import type {
   AssetKind,
   AssetSheet,
   MediaKind,
   TestType,
 } from "@clockwyrks/run-record";
-import {
-  CONCURRENCY_ENV,
-  createSnapshotFetcher,
-  forEachOrdered,
-  resolveConcurrency,
-  SnapshotFetchError,
-  type SnapshotFetcher,
-} from "./snapshot-fetch";
 
-// Build-time data source: the public R2 snapshot.
+// The public snapshot's wire shapes, and how the gallery assembles them into what
+// it reads.
 //
-// The site is fully static and has no live dependency on the backend. The
-// backend exports a read-only public snapshot to a Cloudflare R2 bucket
-// (see design/v0.2.0-contracts.md §3); this plugin fetches that snapshot once,
-// at build time, and writes it into the build in two forms:
-//
-//   - the INDEX — what a listing shows for every run and every case — as the
-//     virtual module `virtual:tcab-snapshot`, inlined into the bundle;
-//   - one static file per run (`runs/<id>.json`, `run-events/<id>.json`), per
-//     case (`cases/<slug>.json`) and per case version
-//     (`cases/<slug>/<version>.json`), which the app fetches from the site's own
-//     origin when a page of that run or case opens.
-//
-// Which form a piece of data takes follows from the kind of data it is, the same
-// way for every run and every case. That is what keeps the bundle's size a
-// function of how MANY runs and cases there are and independent of how much any
-// one of them carries: Cloudflare Pages refuses a deployment holding a file over
-// 25 MiB, and a bundle that inlined every run's media listing crossed it.
-//
-// The snapshot base URL is read from `TCAB_SNAPSHOT_URL` (the public base under
-// which `index.json` is served, e.g. `https://snapshot.testcabinet.ai`). When
-// it is unset — local dev, or a CI build with no snapshot wired up — the virtual
-// module resolves to an empty dataset and the build still succeeds. The
-// `localRuns` dev plugin remains the source of on-disk, unpublished runs during
-// `vite dev`; this plugin contributes the *published* dataset.
-//
-// A set URL whose `index.json` 404s is the *fresh-deployment* case: the bucket
-// exists but nothing has been published yet (`index.json` is the atomic pointer
-// the backend writes last, only on a publish). That, too, resolves to an empty
-// dataset and succeeds — otherwise every gallery build would fail until the very
-// first publish. Only a *reachable-but-broken* snapshot (a network error, a 5xx,
-// or a sub-file that `index.json` references but is missing) fails the build.
-//
-// "A network error" and "a 5xx" mean ones that outlast their retries: every
-// request goes through `./snapshot-fetch`, which gives each attempt a timeout and
-// retries the transient failures, and the per-run documents are fetched several
-// at a time. Neither changes what is assembled or which failures are fatal.
-
-const VIRTUAL_ID = "virtual:tcab-snapshot";
-const RESOLVED_VIRTUAL_ID = "\0" + VIRTUAL_ID;
+// The gallery reads the bucket the backend publishes (see the superrepo's
+// documentation, `components/backend/snapshot.md`) in the browser, at runtime:
+// `./reader` fetches the objects, and this module turns each into the shape the
+// app consumes. It is pure — no fetch, no state — so what a page shows is a
+// function of the objects the bucket held when it read them.
 
 // The engineless run's slug. It mirrors `DEFAULT_ENGINE_SLUG` in
-// `ui-common/packages/ui/src/app/data/engines.ts`, restated rather than imported because this
-// plugin runs in the Vite config, outside the app bundle it would have to pull in
-// to reach it. A snapshot always carries the engineless rendering (it is a
-// variant's own `prompt`/`seededInputs`), so it is always one of the engines a
-// version's inputs can be read under.
+// `ui-common/packages/ui/src/app/data/engines.ts`, restated rather than imported so
+// this module, and its tests in Node, need not pull in the React UI package. A
+// snapshot always carries the engineless rendering (it is a variant's own
+// `prompt`/`seededInputs`), so it is always one of the engines a version's inputs
+// can be read under.
 const NONE_ENGINE_SLUG = "none";
 
 // ---- Snapshot wire shapes (subset of design/v0.2.0-contracts.md §3) ----------
 
-interface SnapshotIndex {
+export interface SnapshotIndex {
   schemaVersion: number;
   snapshotId: string;
   generatedAt: string;
@@ -103,31 +61,31 @@ interface SnapshotIndex {
 
 // `case-showcases.json` (`CaseShowcasesFile`): one entry per case version that
 // declares a showcase, each with its showcased variants in manifest order.
-interface SnapshotCaseShowcasesFile {
+export interface SnapshotCaseShowcasesFile {
   schemaVersion: number;
-  showcases: Array<{
+  showcases: {
     slug: string;
     version: string;
-    variants: Array<{
+    variants: {
       variant: string;
       showcase: NonNullable<SnapshotCaseFile["variants"][number]["showcase"]>;
-    }>;
-  }>;
+    }[];
+  }[];
 }
 
-interface SnapshotModelsFile {
+export interface SnapshotModelsFile {
   schemaVersion: number;
   // Wire `ModelOut` shape; the app maps it via `toModelSummary`.
   models: unknown[];
 }
 
-interface SnapshotComparisonsFile {
+export interface SnapshotComparisonsFile {
   schemaVersion: number;
   // Wire `Comparison` shape (`@clockwyrks/backend-api/comparison`); consumed as-is.
   comparisons: unknown[];
 }
 
-interface SnapshotTestCaseGroupsFile {
+export interface SnapshotTestCaseGroupsFile {
   schemaVersion: number;
   // Wire `TestCaseGroupOut` shape (`TestCaseGroupsFile` in
   // `@clockwyrks/backend-api/snapshot`), already in display order; the app
@@ -137,13 +95,13 @@ interface SnapshotTestCaseGroupsFile {
 
 // The gg document corpus (`gg-runs.json`): every exported gg run as one flat map of
 // dotted fields, plus the instant the export was taken. Consumed as-is — the app's
-// mirrored evaluator reads `GgRunDoc` directly — and inlined into the bundle like every
-// other snapshot payload, so the public analysis surface makes no request at runtime.
+// mirrored evaluator reads `GgRunDoc` directly — and read with the run index when the
+// page loads, so a query on the public analysis surface makes no request of its own.
 //
 // The documents arrive already **filtered** (no experimental case) and **field-redacted**;
 // neither can be re-checked here, which is why both happen at export time. A replay
 // record is never part of this file.
-interface SnapshotGgRunsFile {
+export interface SnapshotGgRunsFile {
   schemaVersion: number;
   generatedAt: string;
   documents: unknown[];
@@ -154,7 +112,7 @@ interface SnapshotGgRunsFile {
 // `runSummaries` — every enriched field is served, so no per-field remapping is
 // needed. An older snapshot that predates a field is tolerated the same way the
 // UI's optional typing tolerates it.
-interface SnapshotRunsFile {
+export interface SnapshotRunsFile {
   schemaVersion: number;
   runs: RunSummary[];
 }
@@ -199,10 +157,9 @@ interface SnapshotReview {
 // `documents/runs/<run-id>/<digest>.json`: the full run record plus its review and
 // links, and the
 // recorded normalized event stream when the run captured one (raw harness output
-// is never published). The events are emitted as a separate per-run static asset
-// rather than inlined into the bundle, so the gallery JS doesn't carry every
-// run's full event log.
-interface SnapshotRunFile {
+// is never published). `assembleRunDocument` sets the events apart from the run's
+// file, so only the Events tab reads them.
+export interface SnapshotRunFile {
   schemaVersion: number;
   record: unknown; // a full RunRecord (camelCase, links populated)
   // Every review submitted against the run (one per reviewer). Only published
@@ -212,25 +169,25 @@ interface SnapshotRunFile {
   events?: unknown; // a JSON array of normalized HarnessEvents, when present
   // The run's uploaded proof-of-implementation media, named by snapshot-relative
   // key. Optional for snapshots written before proofs existed.
-  proofMedia?: Array<{ id: string; kind: "image" | "video"; key: string }>;
+  proofMedia?: { id: string; kind: "image" | "video"; key: string }[];
   // An asset-generation run's media (regenerated/preview/target image + action
   // log), keyed by served file name (`regenerated.png`, `preview.png`,
   // `target.png`, `actions.json`). Absent for a non-asset-generation run and for
   // snapshots written before asset generation existed.
-  assetMedia?: Array<{ file: string; key: string }>;
+  assetMedia?: { file: string; key: string }[];
   // The run's synthesized *actual* automated-validation media (the model build's
   // per-review-item debug-script outputs). `file` is the flat `<item>__<output>.<ext>`
   // name the reviewer UI requests (`.png`/`.webm`); `key` is the published object
   // (a video transcoded to `.mp4`, so `key` and `file` differ in extension for a
   // clip). Absent for a run with no debug scripts and for snapshots written before
   // automated validation existed.
-  validationMedia?: Array<{ file: string; key: string }>;
+  validationMedia?: { file: string; key: string }[];
   // The run's showcase files — the carousel media plus any image the description
   // references. `file` is the recorded name the UI requests; `key` is the published
   // object (a video transcoded to `.mp4`, so `key` and `file` differ in extension
   // for a clip). Absent for a run whose record carries no showcase and for
   // snapshots written before the showcase existed.
-  showcaseMedia?: Array<{ file: string; key: string }>;
+  showcaseMedia?: { file: string; key: string }[];
   // The snapshot-relative key of the run's unbounded code-analysis document (every
   // authored file, scored function, import edge, cycle and clone group), published as
   // its own generation-keyed object so the Code tab fetches it on demand instead of
@@ -241,7 +198,7 @@ interface SnapshotRunFile {
 }
 
 // `cases/<slug>/<version>.json`: the site-facing slice of a test-case version.
-interface SnapshotCaseFile {
+export interface SnapshotCaseFile {
   schemaVersion: number;
   slug: string;
   version: string;
@@ -273,7 +230,7 @@ interface SnapshotCaseFile {
   // This version's own changelog entry (its `changelog.md` body). Optional for
   // snapshots written before changelogs existed.
   changelog?: string | null;
-  variants: Array<{
+  variants: {
     slug: string;
     name: string;
     description: string | null;
@@ -321,12 +278,12 @@ interface SnapshotCaseFile {
     // the field existed.
     showcase?: {
       description: string;
-      media: Array<{
+      media: {
         file: string;
         name: string;
         kind: MediaKind;
         key: string;
-      }>;
+      }[];
     } | null;
     // The variant's effective starter-workspace files for the ENGINELESS
     // rendering (`CaseWorkspaceFileOut[]`): the run-root-relative destination
@@ -335,8 +292,8 @@ interface SnapshotCaseFile {
     // per-engine sets ride on each `engineRenderings` entry. Absent on snapshots
     // written before the field existed.
     workspaceFiles?: SnapshotWorkspaceFile[];
-  }>;
-  checks?: Array<{ view: string; name: string; referenceView: string | null }>;
+  }[];
+  checks?: { view: string; name: string; referenceView: string | null }[];
   // The runtime packages this case ships into every run (case-level), each with a
   // UI-only description. Optional for snapshots written before the field existed.
   packages?: SnapshotPackage[];
@@ -348,14 +305,14 @@ interface SnapshotCaseFile {
   // Optional: reference screenshots exposed as snapshot-relative keys. The
   // contract permits emitting these per case; when present we resolve them to
   // absolute URLs so the References tab can show baselines.
-  references?: Array<{
+  references?: {
     variant: string | null; // null/`_common` => shown on every variant
     view: string;
     // How the reference is produced: rendered mockup, static image, or static
     // video. Optional for snapshots written before the field existed.
     kind?: "rendered" | "image" | "video";
     key: string; // snapshot-relative object key
-  }>;
+  }[];
   // The case's committed **baseline** automated-validation media (a debug script's
   // outputs driven once against the reference implementation), per variant. `file` is
   // the flat `<item>__<output>.<ext>` name the reviewer UI requests (`.png`/`.webm`);
@@ -363,12 +320,12 @@ interface SnapshotCaseFile {
   // gallery resolves the reviewer's baseline side-by-side from these keyed by
   // slug/version/engine/variant. Optional for snapshots written before automated
   // validation existed.
-  validationBaselines?: Array<{
+  validationBaselines?: {
     engine: string;
     variant: string;
     file: string;
     key: string;
-  }>;
+  }[];
   // Known-issue errata recorded for this version after it shipped (`CaseErratumOut`).
   // Optional for snapshots written before errata existed.
   errata?: SnapshotErratum[];
@@ -485,7 +442,7 @@ interface SnapshotDomain {
 // ---- The shape the app consumes (mirrors src/data/testCases.ts) -------------
 
 // One assembled review the app consumes (the gallery's `StoredReview`).
-interface AssembledReview {
+export interface AssembledReview {
   reviewer: string;
   ratings: SnapshotDomainRating[];
   // The run-wide aesthetic tier; null on a legacy run's review. A stale
@@ -499,46 +456,11 @@ interface AssembledReview {
   reviewedAt: string | null;
 }
 
-// The INDEX: what a listing shows for every run and every case. It is the whole
-// of what `virtual:tcab-snapshot` inlines into the bundle, so it is what every
-// visitor downloads before the home page renders. Everything that describes one
-// run or one case in detail is written to that run's or that case's own file
-// instead (`AssembledRunFile`, `AssembledCaseDetail`, `AssembledCaseVersion`),
-// and the placement follows the kind of data, never the size of one entry.
-interface AssembledSnapshot {
-  // The flat summary index (`runs.json`), newest first — the bounded `RunSummary`
-  // cards the run log and list pages consume, taken verbatim from the backend's
-  // published index (no extra fetches). The app types these as RunSummary[].
-  runSummaries: RunSummary[];
-  // One listing card per case, mapped to the app's TestCaseSummary shape.
-  testCases: AssembledCaseSummary[];
-  // The composed model catalog (wire `ModelOut[]`); the app maps it via
-  // `toModelSummary`. Empty when the snapshot predates the model catalog.
-  models: unknown[];
-  // The published harness comparisons (wire `Comparison[]`), each already the full
-  // read model the backend assembled. Empty when the snapshot has none.
-  comparisons: unknown[];
-  // The test-case groups (wire `TestCaseGroupOut[]`), already in display order —
-  // the home page's per-group leaderboards. Empty when the snapshot predates them.
-  testCaseGroups: unknown[];
-  // The gg document corpus and the instant it was exported, or null when the snapshot
-  // carries none — in which case the site mounts no analysis surface. Held whole rather
-  // than remapped: the app's evaluator reads these documents as they are.
-  ggRuns: { generatedAt: string; documents: unknown[] } | null;
-  // The media each case's catalog card previews (its `showcase`), resolved to
-  // absolute URLs and keyed by the previewed `<slug>/<version>/<variant>` subject
-  // then by the authored file name. The catalog is a listing, so this one slice
-  // of a case version's showcase media is index data. The previewed version may
-  // have no file of its own (no published run built it), so these addresses are
-  // the only ones the site holds for it.
-  catalogShowcaseMediaUrls: Record<string, Record<string, string>>;
-}
-
-// `runs/<id>.json`: everything the gallery reads about ONE run when a page of it
-// opens — the record, the reviews, and where each of its published media files
-// is. The event log is its own file (`run-events/<id>.json`), because only the
+// Everything the gallery reads about ONE run when a page of it opens, assembled
+// from the run's document — the record, the reviews, and where each of its
+// published media files is. The event log is set apart from it, because only the
 // Events tab reads it.
-interface AssembledRunFile {
+export interface AssembledRunFile {
   // The full RunRecord (camelCase, links populated), verbatim.
   record: unknown;
   // Every review submitted against the run, one per reviewer. Empty for a
@@ -549,7 +471,7 @@ interface AssembledRunFile {
 
 // Where one run's published media is, each map keyed by the file name the UI
 // requests and holding the absolute URL of the published object.
-interface AssembledRunMedia {
+export interface AssembledRunMedia {
   // Proof media, keyed by served file name (`<proof-id>.<ext>`).
   proof: Record<string, string>;
   // Asset-generation media, keyed by served file name (`regenerated.png`,
@@ -579,7 +501,7 @@ interface AssembledRunMedia {
 }
 
 // One case's listing card (mirrors `TestCaseSummary` in the UI's testCases).
-interface AssembledCaseSummary {
+export interface AssembledCaseSummary {
   slug: string;
   name: string;
   testType: TestType;
@@ -590,8 +512,8 @@ interface AssembledCaseSummary {
   tags: string[];
   summary: string | null;
   // Every published version, newest first, and the newest of them. A version is
-  // listed exactly when its `cases/<slug>/<version>.json` was emitted, so the app
-  // asks only for files the build holds.
+  // listed exactly when its `cases/<slug>/<version>.json` was read, so a version
+  // the catalog lists is one the gallery holds.
   versions: string[];
   latestVersion: string;
   // The case's catalog SHOWCASE PREVIEW (mirrors `CatalogShowcase` in the UI's
@@ -606,10 +528,10 @@ interface AssembledCaseSummary {
   } | null;
 }
 
-// `cases/<slug>.json`: what spans a case's versions and only a page of that case
+// What spans a case's versions and only a page of that case
 // reads (the rest of `TestCaseDetail` in the UI's testCases). The variants
 // themselves are per version — see `AssembledCaseVersion`.
-interface AssembledCaseDetail {
+export interface AssembledCaseDetail {
   // The latest version's site-facing description.
   description: string | null;
   // Every version's own description, latest included, keyed by version — a
@@ -636,18 +558,17 @@ interface AssembledCaseDetail {
   sheet: AssetSheet | null;
 }
 
-// `cases/<slug>/<version>.json`: ONE version of a case — the variants a run of
-// that version was given, and where the version's own media is. A file per
-// version rather than per case, so a page reads the one version it shows and a
-// case's file does not grow with every version it gains.
-interface AssembledCaseVersion {
+// ONE version of a case, assembled from its `cases/<slug>/<version>.json` — the
+// variants a run of that version was given, and where the version's own media
+// is.
+export interface AssembledCaseVersion {
   variants: AssembledVariant[];
   media: AssembledCaseVersionMedia;
 }
 
 // Where one case version's media is, each inner map keyed by the file name the
 // UI requests and holding the absolute URL of the published object.
-interface AssembledCaseVersionMedia {
+export interface AssembledCaseVersionMedia {
   // The *baseline* automated-validation media (the reference implementation's
   // declared outputs), keyed by `<engine>/<variant>` then the flat
   // `<item>__<output>.<ext>` name. The engine is in the key because a variant has
@@ -736,8 +657,8 @@ interface AssembledSubReviewItem {
 // items and weight) rather than forming a duplicate group. A fresh-id variant item
 // is appended, preserving "common first, then the variant's own". A local mirror of
 // `mergeReviewItems` in ui-common/packages/ui/src/ratings.ts (and `merge_review_items` in the
-// Rust core) — duplicated rather than imported so this build-time plugin need not
-// pull the React UI package.
+// Rust core) — duplicated rather than imported so this module, and its tests in
+// Node, need not pull in the React UI package.
 function mergeSnapshotReviewItems(
   common: readonly SnapshotReviewItem[],
   variant: readonly SnapshotReviewItem[],
@@ -911,24 +832,14 @@ interface MappedCaseVersion {
   media: AssembledCaseVersionMedia;
 }
 
-// One case, split the way the build writes it: the listing card the index
-// carries, the detail file a page of the case reads, and one file per version.
+// One case, split the way the gallery reads it: the listing card the catalog
+// lists, the detail a page of the case reads, and one file per version.
 interface AssembledCase {
   summary: AssembledCaseSummary;
   detail: AssembledCaseDetail;
   // Newest version first.
-  versions: Array<{ version: string; file: AssembledCaseVersion }>;
+  versions: { version: string; file: AssembledCaseVersion }[];
 }
-
-const EMPTY: AssembledSnapshot = {
-  runSummaries: [],
-  testCases: [],
-  models: [],
-  comparisons: [],
-  testCaseGroups: [],
-  ggRuns: null,
-  catalogShowcaseMediaUrls: {},
-};
 
 // Aesthetic tiers, ordered best to worst — the second channel, one run-wide
 // tier per review of a validator-rated run. Mirrors `AESTHETIC_RATINGS` in
@@ -941,10 +852,9 @@ function worstOn(order: readonly string[], tiers: string[]): string | null {
   let worstRank = -1;
   for (const tier of tiers) {
     const rank = order.indexOf(tier);
-    if (rank > worstRank) {
-      worstRank = rank;
-      worst = tier;
-    }
+    if (rank <= worstRank) continue;
+    worstRank = rank;
+    worst = tier;
   }
   return worst;
 }
@@ -971,11 +881,11 @@ function isImageStoreFile(file: string): boolean {
 /** Everything of a published key up to and including its last `/`. */
 function prefixOf(key: string): string {
   const cut = key.lastIndexOf("/");
-  return cut < 0 ? "" : key.slice(0, cut + 1);
+  return cut === -1 ? "" : key.slice(0, cut + 1);
 }
 
 // Join a base URL with a snapshot-relative key, collapsing any double slash.
-function joinUrl(base: string, key: string): string {
+export function joinUrl(base: string, key: string): string {
   return `${base.replace(/\/+$/, "")}/${key.replace(/^\/+/, "")}`;
 }
 
@@ -1067,11 +977,13 @@ function mapCase(base: string, file: SnapshotCaseFile): MappedCaseVersion {
   }));
   const variants: AssembledVariant[] = file.variants.map((variant) => {
     const own = refs.filter((r) => r.variant === variant.slug);
-    const referenceScreenshots = [...commonRefs, ...own].map((r) => ({
-      view: r.view,
-      kind: (r.kind === "video" ? "video" : "image") as "image" | "video",
-      url: joinUrl(base, r.key),
-    }));
+    const referenceScreenshots = [...commonRefs, ...own].map(
+      (r): AssembledReference => ({
+        view: r.view,
+        kind: r.kind === "video" ? "video" : "image",
+        url: joinUrl(base, r.key),
+      }),
+    );
     // Each variant carries its complete, seed-ordered seeded spec set (the common
     // specs first, then its own), every body already rendered for the variant (a
     // template spec's conditionals resolved) — the same order a run is seeded and
@@ -1102,8 +1014,11 @@ function mapCase(base: string, file: SnapshotCaseFile): MappedCaseVersion {
     // Rust `review_items_for` / `apply_score_exclusions`.
     const excludedVerdictIds = new Set<string>();
     for (const erratum of file.errata ?? []) {
-      if (!erratum.excludeFromScore) continue;
-      if (erratum.variant != null && erratum.variant !== variant.slug) continue;
+      if (
+        !erratum.excludeFromScore ||
+        (erratum.variant != null && erratum.variant !== variant.slug)
+      )
+        continue;
       if (erratum.review) excludedVerdictIds.add(erratum.review);
     }
     // The common checklist items apply to every variant; the variant's own
@@ -1302,7 +1217,7 @@ function mapCaseMedia(
     // `contracts/crates/contracts/src/asset_reference.rs`) and the console's
     // `referenceMediaKey` in `ui-common/packages/ui/src/transport/httpBackend.ts`;
     // all three must change together. The console's helper is not imported here
-    // because this build-time plugin must not pull in the React UI package.
+    // because this module must not pull in the React UI package.
     const frames = variant.referenceSheet?.frames;
     if (frames?.length) {
       const byFile: Record<string, string> = {};
@@ -1319,7 +1234,7 @@ function mapCaseMedia(
 }
 
 // Group the per-(slug, version) case files into one case per slug, newest
-// version first, and split each into the three places the build writes it: the
+// version first, and split each into the three parts the gallery reads: the
 // listing card, the detail that spans its versions, and one file per version.
 // Cases come out in the order the files first named them.
 function assembleCases(
@@ -1390,21 +1305,6 @@ function assembleCases(
   return result;
 }
 
-/**
- * Where `loadSnapshot` hands each static file's content as it assembles it. The
- * plugin writes each to the path the app fetches it from; the tests collect them.
- */
-export interface SnapshotEmitter {
-  /** One run's file (`runs/<id>.json`): its record, reviews and media. */
-  run(runId: string, json: string): void;
-  /** One run's event log (`run-events/<id>.json`), for a run that recorded one. */
-  events(runId: string, json: string): void;
-  /** One case's detail (`cases/<slug>.json`). */
-  caseDetail(slug: string, json: string): void;
-  /** One case version (`cases/<slug>/<version>.json`). */
-  caseVersion(slug: string, version: string, json: string): void;
-}
-
 // The showcase a case's catalog card previews: the first variant (manifest order)
 // with media to show, of the case's newest version that has one. Null when no
 // version of the case carries a showcase.
@@ -1436,169 +1336,104 @@ function newestCaseShowcase(
   return null;
 }
 
-// Fetch and assemble the published snapshot. Follows the atomic pointer
-// `index.json` -> versioned prefix -> `runs.json` -> per-run + per-case files.
-// It returns the INDEX, which the plugin inlines, and hands everything that
-// describes one run or one case to `emit`, which the plugin writes out as the
-// static files the app fetches when a page of that run or case opens.
-//
-// Every document is read through `fetcher`, and the per-run and per-case
-// documents `concurrency` at a time. The emitter is still called in the
-// snapshot's own order — a run's file before its events and one run after
-// another, then one case after another, its detail before its versions — so
-// what is assembled and emitted is independent of the concurrency.
-//
-// Exported for the plugin's tests, which drive it with a scripted `fetch`.
-export async function loadSnapshot(
+/** A run's document as the gallery reads it: its file, and its event log apart. */
+export interface AssembledRunDocument {
+  file: AssembledRunFile;
+  /** The normalized event stream, or null for a run that recorded none. */
+  events: unknown[] | null;
+}
+
+// Assemble one run's document: its record and reviews verbatim, each media key
+// resolved to its absolute URL under `base`, and the event log set apart.
+export function assembleRunDocument(
   base: string,
-  emit: SnapshotEmitter,
-  fetcher: SnapshotFetcher,
-  concurrency: number,
-): Promise<AssembledSnapshot | null> {
-  // `index.json` is the atomic pointer the backend writes last, only after a
-  // publish. A 404 here means nothing has been published yet (a fresh
-  // deployment), which is the empty-dataset bootstrap case — signal it with
-  // `null` so the build succeeds empty. Any other non-OK status is a genuinely
-  // broken snapshot and must fail the build.
-  let index: SnapshotIndex;
-  try {
-    index = await fetcher.json<SnapshotIndex>(joinUrl(base, "index.json"));
-  } catch (error) {
-    if (error instanceof SnapshotFetchError && error.status === 404) {
-      return null;
-    }
-    throw error;
+  runFile: SnapshotRunFile,
+): AssembledRunDocument {
+  const media: AssembledRunMedia = {
+    proof: {},
+    asset: {},
+    validation: {},
+    validationStorePrefix: null,
+    showcase: {},
+    // Absent for a run that was never analysed, which is the honest default
+    // rather than an empty document.
+    codeAnalysisUrl: runFile.codeAnalysisKey
+      ? joinUrl(base, runFile.codeAnalysisKey)
+      : null,
+  };
+  // Proof media is keyed by served file name, the key's last segment.
+  for (const proof of runFile.proofMedia ?? []) {
+    const file = proof.key.split("/").pop() ?? proof.key;
+    media.proof[file] = joinUrl(base, proof.key);
   }
-  const runsFile = await fetcher.json<SnapshotRunsFile>(
-    joinUrl(base, index.runsKey),
-  );
-
-  // The case-version keys referenced by published runs; deduplicated.
-  const caseKeys = new Set<string>();
-
-  // The run's document is content-addressed under a snapshot-independent prefix, so
-  // the summary is what names it — the key carries a digest of the document's own
-  // bytes and cannot be composed from the run id. A summary in `runs.json` always
-  // carries one; a missing key is a malformed snapshot, not a fallback path. Checked
-  // for every run before the first document is requested, so a malformed index fails
-  // the build without a download.
-  const runDocuments = runsFile.runs.map((summary) => {
-    if (!summary.documentKey) {
-      throw new Error(
-        `snapshot run summary ${summary.id} carries no documentKey; the snapshot is malformed`,
-      );
+  for (const asset of runFile.assetMedia ?? []) {
+    media.asset[asset.file] = joinUrl(base, asset.key);
+  }
+  for (const entry of runFile.validationMedia ?? []) {
+    // A recording's shared image store contributes ONE prefix rather than one
+    // entry per file: the names are content-addressed and published verbatim,
+    // so a prefix taken from any one of the run's store keys resolves all of
+    // them.
+    if (isImageStoreFile(entry.file)) {
+      media.validationStorePrefix ??= joinUrl(base, prefixOf(entry.key));
+      continue;
     }
-    return { summary, url: joinUrl(base, summary.documentKey) };
-  });
-
-  // One file per run. The documents are fetched several at a time and assembled
-  // in the snapshot's newest-first order, one run after another.
-  const assembleRun = (
-    runFile: SnapshotRunFile,
-    { summary }: { summary: RunSummary },
-  ): void => {
-    const media: AssembledRunMedia = {
-      proof: {},
-      asset: {},
-      validation: {},
-      validationStorePrefix: null,
-      showcase: {},
-      // Absent for a run that was never analysed, which is the honest default
-      // rather than an empty document.
-      codeAnalysisUrl: runFile.codeAnalysisKey
-        ? joinUrl(base, runFile.codeAnalysisKey)
-        : null,
-    };
-    // Proof media is keyed by served file name, the key's last segment.
-    for (const proof of runFile.proofMedia ?? []) {
-      const file = proof.key.split("/").pop() ?? proof.key;
-      media.proof[file] = joinUrl(base, proof.key);
-    }
-    for (const asset of runFile.assetMedia ?? []) {
-      media.asset[asset.file] = joinUrl(base, asset.key);
-    }
-    for (const entry of runFile.validationMedia ?? []) {
-      // A recording's shared image store contributes ONE prefix rather than one
-      // entry per file: the names are content-addressed and published verbatim,
-      // so a prefix taken from any one of the run's store keys resolves all of
-      // them.
-      if (isImageStoreFile(entry.file)) {
-        media.validationStorePrefix ??= joinUrl(base, prefixOf(entry.key));
-        continue;
-      }
-      media.validation[entry.file] = joinUrl(base, entry.key);
-    }
-    for (const entry of runFile.showcaseMedia ?? []) {
-      media.showcase[entry.file] = joinUrl(base, entry.key);
-    }
-    const assembled: AssembledRunFile = {
+    media.validation[entry.file] = joinUrl(base, entry.key);
+  }
+  for (const entry of runFile.showcaseMedia ?? []) {
+    media.showcase[entry.file] = joinUrl(base, entry.key);
+  }
+  return {
+    file: {
       record: runFile.record,
       reviews: (runFile.reviews ?? []).map(toAssembledReview),
       media,
-    };
-    emit.run(summary.id, JSON.stringify(assembled));
-    // The recorded events are a file of their own (only when present), so a page
-    // of the run does not download a log only its Events tab reads.
-    if (runFile.events != null) {
-      emit.events(summary.id, JSON.stringify(runFile.events));
-    }
-    const { testCaseSlug, testCaseVersion } = summary.subject;
-    caseKeys.add(`${index.casesPrefix}${testCaseSlug}/${testCaseVersion}.json`);
+    },
+    events: Array.isArray(runFile.events)
+      ? (runFile.events as unknown[])
+      : null,
   };
-  await forEachOrdered(
-    runDocuments,
-    concurrency,
-    ({ url }) => fetcher.json<SnapshotRunFile>(url),
-    assembleRun,
-  );
+}
 
-  // Per-case-version metadata for every case a published run references, in the
-  // order the runs first referenced them.
-  const caseFiles: SnapshotCaseFile[] = [];
-  await forEachOrdered(
-    [...caseKeys],
-    concurrency,
-    async (key) => {
-      try {
-        return await fetcher.json<SnapshotCaseFile>(joinUrl(base, key));
-      } catch {
-        // A run can reference a historical case-version the snapshot did not
-        // emit; skip it rather than failing the whole build (the run still shows,
-        // it just lacks framing metadata).
-        return null;
-      }
-    },
-    (file) => {
-      if (file !== null) caseFiles.push(file);
-    },
-  );
+/** The case catalog: every case a published run built, assembled. */
+export interface AssembledCatalog {
+  /** One listing card per case, in the order the runs first named them. */
+  testCases: AssembledCaseSummary[];
+  /** Each case's detail, by slug. */
+  details: Map<string, AssembledCaseDetail>;
+  /** Each case version's file, by `<slug>/<version>`. */
+  versions: Map<string, AssembledCaseVersion>;
+  /**
+   * The media each case's catalog card previews (its `showcase`), resolved to
+   * absolute URLs and keyed by the previewed `<slug>/<version>/<variant>` subject
+   * then by the authored file name. The previewed version may have no case file
+   * (no published run built it), so these addresses are the only ones the gallery
+   * holds for it.
+   */
+  catalogShowcaseMediaUrls: Record<string, Record<string, string>>;
+}
 
-  // The case showcases, which a case's catalog preview is taken from: its newest
-  // version's, whether or not a run of that version is published. Absent from a
-  // snapshot published before the file existed, and unreadable is treated the
-  // same way — the preview then falls back to the newest case file's showcase.
-  let caseShowcases: SnapshotCaseShowcasesFile | null = null;
-  if (index.caseShowcasesKey) {
-    try {
-      caseShowcases = await fetcher.json<SnapshotCaseShowcasesFile>(
-        joinUrl(base, index.caseShowcasesKey),
-      );
-    } catch {
-      // Missing/unreadable: preview from the case files rather than failing the
-      // whole build.
-    }
-  }
-
-  // One detail file per case and one file per version of it; the listing card
-  // and the media its catalog preview shows are all the index keeps of a case.
-  const testCases: AssembledCaseSummary[] = [];
-  const catalogShowcaseMediaUrls: Record<string, Record<string, string>> = {};
+// Assemble the catalog from the case files the published runs name and, when the
+// snapshot has one, `case-showcases.json`, which a case's catalog preview is taken
+// from: its newest version's, whether or not a run of that version is published.
+// Without it the preview falls back to the newest case file's showcase.
+export function assembleCatalog(
+  base: string,
+  caseFiles: SnapshotCaseFile[],
+  caseShowcases: SnapshotCaseShowcasesFile | null,
+): AssembledCatalog {
+  const catalog: AssembledCatalog = {
+    testCases: [],
+    details: new Map(),
+    versions: new Map(),
+    catalogShowcaseMediaUrls: {},
+  };
   for (const assembled of assembleCases(base, caseFiles)) {
     const { summary } = assembled;
-    testCases.push(summary);
-    emit.caseDetail(summary.slug, JSON.stringify(assembled.detail));
+    catalog.testCases.push(summary);
+    catalog.details.set(summary.slug, assembled.detail);
     for (const { version, file } of assembled.versions) {
-      emit.caseVersion(summary.slug, version, JSON.stringify(file));
+      catalog.versions.set(`${summary.slug}/${version}`, file);
     }
     if (caseShowcases) {
       const preview = newestCaseShowcase(caseShowcases, summary.slug);
@@ -1618,7 +1453,7 @@ export async function loadSnapshot(
         for (const entry of preview.media) {
           byFile[entry.file] = joinUrl(base, entry.key);
         }
-        catalogShowcaseMediaUrls[
+        catalog.catalogShowcaseMediaUrls[
           `${summary.slug}/${preview.version}/${preview.variant}`
         ] = byFile;
       }
@@ -1628,279 +1463,11 @@ export async function loadSnapshot(
         (entry) => entry.version === version,
       )?.file.media.showcase[variant];
       if (previewed) {
-        catalogShowcaseMediaUrls[`${summary.slug}/${version}/${variant}`] =
-          previewed;
+        catalog.catalogShowcaseMediaUrls[
+          `${summary.slug}/${version}/${variant}`
+        ] = previewed;
       }
     }
   }
-
-  // The model catalog. Absent from a snapshot published before it existed, in
-  // which case the Models section renders empty.
-  let models: unknown[] = [];
-  if (index.modelsKey) {
-    try {
-      const modelsFile = await fetcher.json<SnapshotModelsFile>(
-        joinUrl(base, index.modelsKey),
-      );
-      models = modelsFile.models;
-    } catch {
-      // Missing/unreadable catalog file: render an empty Models section rather
-      // than failing the whole build.
-    }
-  }
-
-  // The published harness comparisons. Absent from a snapshot published before
-  // they existed, in which case the site simply has none.
-  let comparisons: unknown[] = [];
-  if (index.comparisonsKey) {
-    try {
-      const comparisonsFile = await fetcher.json<SnapshotComparisonsFile>(
-        joinUrl(base, index.comparisonsKey),
-      );
-      comparisons = comparisonsFile.comparisons;
-    } catch {
-      // Missing/unreadable comparisons file: render none rather than failing the
-      // whole build.
-    }
-  }
-
-  // The test-case groups. Absent from a snapshot published before they existed,
-  // in which case the home page simply renders no group leaderboards.
-  let testCaseGroups: unknown[] = [];
-  if (index.testCaseGroupsKey) {
-    try {
-      const groupsFile = await fetcher.json<SnapshotTestCaseGroupsFile>(
-        joinUrl(base, index.testCaseGroupsKey),
-      );
-      testCaseGroups = groupsFile.groups;
-    } catch {
-      // Missing/unreadable groups file: render none rather than failing the
-      // whole build.
-    }
-  }
-
-  // The gg document corpus. Absent from a snapshot published before the gg export
-  // existed, in which case the site mounts no analysis surface rather than an empty one.
-  let ggRuns: AssembledSnapshot["ggRuns"] = null;
-  if (index.ggRunsKey) {
-    try {
-      const ggRunsFile = await fetcher.json<SnapshotGgRunsFile>(
-        joinUrl(base, index.ggRunsKey),
-      );
-      ggRuns = {
-        generatedAt: ggRunsFile.generatedAt,
-        documents: ggRunsFile.documents,
-      };
-    } catch {
-      // Missing/unreadable corpus: no analysis surface rather than a failed build,
-      // matching how every other optional snapshot payload degrades.
-    }
-  }
-
-  return {
-    // The already-fetched summary index — the bounded cards, verbatim. No extra
-    // network calls.
-    runSummaries: runsFile.runs,
-    testCases,
-    models,
-    comparisons,
-    testCaseGroups,
-    ggRuns,
-    catalogShowcaseMediaUrls,
-  };
-}
-
-// The index as the source of `virtual:tcab-snapshot`. Exported for the plugin's
-// tests, which compare two loads byte for byte.
-export function serialize(data: AssembledSnapshot): string {
-  return [
-    "// Generated at build time by vite-plugin-snapshot. Do not edit.",
-    `export const runSummaries = ${JSON.stringify(data.runSummaries)};`,
-    `export const testCases = ${JSON.stringify(data.testCases)};`,
-    `export const models = ${JSON.stringify(data.models)};`,
-    `export const comparisons = ${JSON.stringify(data.comparisons)};`,
-    `export const testCaseGroups = ${JSON.stringify(data.testCaseGroups)};`,
-    `export const ggRuns = ${JSON.stringify(data.ggRuns)};`,
-    `export const catalogShowcaseMediaUrls = ${JSON.stringify(data.catalogShowcaseMediaUrls)};`,
-  ].join("\n");
-}
-
-/** The largest file a Cloudflare Pages deployment accepts, in bytes (25 MiB). */
-export const PAGES_FILE_LIMIT_BYTES = 25 * 1024 * 1024;
-
-/** One file of the build's output and its size on disk. */
-export interface BuiltFile {
-  fileName: string;
-  bytes: number;
-}
-
-/** What the build reports about the sizes of the files it wrote. */
-export interface SizeReport {
-  /** The largest JavaScript file — the bundle the index is inlined into. */
-  bundle: BuiltFile | null;
-  /** The largest of the per-run and per-case data files. */
-  data: BuiltFile | null;
-  /** Every file over `limit`, largest first. A deployment holding one is refused. */
-  oversized: BuiltFile[];
-}
-
-/**
- * Measure a build's files against the per-file limit of the host it deploys to.
- *
- * Exported for the plugin's tests.
- */
-export function reportSizes(
-  files: Iterable<BuiltFile>,
-  limit: number = PAGES_FILE_LIMIT_BYTES,
-): SizeReport {
-  const largest = (a: BuiltFile | null, b: BuiltFile): BuiltFile =>
-    a === null || b.bytes > a.bytes ? b : a;
-  const report: SizeReport = { bundle: null, data: null, oversized: [] };
-  for (const file of files) {
-    if (file.fileName.endsWith(".js")) {
-      report.bundle = largest(report.bundle, file);
-    } else if (DATA_FILE.test(file.fileName)) {
-      report.data = largest(report.data, file);
-    }
-    if (file.bytes > limit) report.oversized.push(file);
-  }
-  report.oversized.sort((a, b) => b.bytes - a.bytes);
-  return report;
-}
-
-// The static files this plugin emits, by the directories it writes them under.
-const DATA_FILE = /^(runs|run-events|cases)\/.*\.json$/;
-
-function mebibytes(bytes: number): string {
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-}
-
-export function snapshot(): Plugin {
-  // Read once per build. The dev server does not fetch the published snapshot
-  // (the localRuns plugin supplies dev data); it resolves to the empty dataset.
-  let module: string | null = null;
-  let isBuild = false;
-
-  return {
-    name: "ttc-snapshot",
-    config(_config, env) {
-      isBuild = env.command === "build";
-    },
-    async buildStart() {
-      if (!isBuild) {
-        module = serialize(EMPTY);
-        return;
-      }
-      const base = process.env.TCAB_SNAPSHOT_URL?.trim();
-      if (!base) {
-        this.warn(
-          "TCAB_SNAPSHOT_URL is not set; building with an empty published dataset.",
-        );
-        module = serialize(EMPTY);
-        return;
-      }
-      let concurrency: number;
-      try {
-        concurrency = resolveConcurrency(process.env[CONCURRENCY_ENV]);
-      } catch (error) {
-        this.error(error instanceof Error ? error.message : String(error));
-      }
-      const fetcher = createSnapshotFetcher();
-      const started = performance.now();
-      try {
-        // Each file is written at the stable, predictable path the static site
-        // fetches it from at runtime.
-        const emitted = { runs: 0, events: 0, cases: 0, caseVersions: 0 };
-        const write = (fileName: string, source: string): void => {
-          this.emitFile({ type: "asset", fileName, source });
-        };
-        const data = await loadSnapshot(
-          base,
-          {
-            run: (runId, json) => {
-              write(`runs/${runId}.json`, json);
-              emitted.runs += 1;
-            },
-            events: (runId, json) => {
-              write(`run-events/${runId}.json`, json);
-              emitted.events += 1;
-            },
-            caseDetail: (slug, json) => {
-              write(`cases/${slug}.json`, json);
-              emitted.cases += 1;
-            },
-            caseVersion: (slug, version, json) => {
-              write(`cases/${slug}/${version}.json`, json);
-              emitted.caseVersions += 1;
-            },
-          },
-          fetcher,
-          concurrency,
-        );
-        if (data === null) {
-          this.warn(
-            `no published snapshot at ${base} yet (index.json 404); building with an empty dataset. The backend's deploy hook will rebuild the gallery once a run is published.`,
-          );
-          module = serialize(EMPTY);
-          return;
-        }
-        this.info(
-          `fetched snapshot from ${base}: ${data.runSummaries.length} run(s), ${data.testCases.length} case(s) in ${emitted.caseVersions} version(s), ${emitted.events} event log(s), ${emitted.runs} run file(s).`,
-        );
-        this.info(
-          `fetched ${fetcher.fetched} snapshot document(s), ${fetcher.retried} of them after a retry, in ${((performance.now() - started) / 1000).toFixed(1)} s (${concurrency} at a time).`,
-        );
-        module = serialize(data);
-      } catch (error) {
-        // A reachable-but-broken snapshot must fail the build loudly rather
-        // than silently shipping an empty gallery over real data.
-        this.error(
-          `failed to fetch public snapshot from ${base}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    },
-    resolveId(id) {
-      if (id === VIRTUAL_ID) return RESOLVED_VIRTUAL_ID;
-      return null;
-    },
-    load(id) {
-      if (id === RESOLVED_VIRTUAL_ID) {
-        return module ?? serialize(EMPTY);
-      }
-      return null;
-    },
-    // Every file is final here (chunks are already minified), so this is where
-    // the build's sizes are what the deployment will hold. Cloudflare Pages
-    // refuses a deployment with a file over its limit and keeps serving the last
-    // one it accepted, so the gallery goes stale without anything looking broken;
-    // failing here names the file in the build that produced it.
-    generateBundle(_options, bundle) {
-      if (!isBuild) return;
-      const report = reportSizes(
-        Object.values(bundle).map((file) => ({
-          fileName: file.fileName,
-          bytes:
-            file.type === "chunk"
-              ? Buffer.byteLength(file.code)
-              : Buffer.byteLength(file.source),
-        })),
-      );
-      const describe = (file: BuiltFile | null): string =>
-        file === null ? "none" : `${file.fileName} (${mebibytes(file.bytes)})`;
-      this.info(
-        `largest bundle file: ${describe(report.bundle)}; largest data file: ${describe(report.data)}; the limit per file is ${mebibytes(PAGES_FILE_LIMIT_BYTES)}.`,
-      );
-      if (report.oversized.length > 0) {
-        this.error(
-          `${report.oversized
-            .map(describe)
-            .join(
-              ", ",
-            )} exceeds the ${mebibytes(PAGES_FILE_LIMIT_BYTES)} a Cloudflare Pages deployment accepts per file, so this build cannot be deployed. The bundle inlines the snapshot's index (see AssembledSnapshot in vite-plugin-snapshot.ts): data about one run or one case belongs in that run's or that case's own file.`,
-        );
-      }
-    },
-  };
+  return catalog;
 }

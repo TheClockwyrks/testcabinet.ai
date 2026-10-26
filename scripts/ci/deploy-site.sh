@@ -16,11 +16,13 @@
 # CLOUDFLARE_API_TOKEN (Cloudflare Pages: Edit) and CLOUDFLARE_ACCOUNT_ID must
 # be in the environment. The pipeline's deploy stage maps the first from the
 # definition's per-branch variable and the other two from its secret variables
-# of the same names. The build bakes the dataset at TCAB_SNAPSHOT_URL into the
-# bundle and, without one, builds an empty gallery, so a URL that is missing,
-# empty or not an http(s) URL (an undefined pipeline variable reaches the step
-# as its own `$(NAME)` text) is refused before anything is built rather than
-# deployed over the live gallery.
+# of the same names. The build writes TCAB_SNAPSHOT_URL into the page as the
+# bucket it reads the published dataset from in the browser, and bakes in
+# nothing of the dataset itself, so a publish needs no deploy. A gallery built
+# without one reads nothing, so a URL that is missing, empty or not an http(s)
+# URL (an undefined pipeline variable reaches the step as its own `$(NAME)`
+# text) is refused before anything is built rather than deployed over the live
+# gallery.
 set -euo pipefail
 
 # The wrangler release the project's sites deploy with (WRANGLER_VERSION in
@@ -46,7 +48,7 @@ esac
 
 : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN must be set}"
 : "${CLOUDFLARE_ACCOUNT_ID:?CLOUDFLARE_ACCOUNT_ID must be set}"
-: "${TCAB_SNAPSHOT_URL:?TCAB_SNAPSHOT_URL must be set: an unset URL builds an empty gallery}"
+: "${TCAB_SNAPSHOT_URL:?TCAB_SNAPSHOT_URL must be set: a gallery built without one reads no bucket}"
 if [[ ! "$TCAB_SNAPSHOT_URL" =~ ^https?://[^[:space:]]+$ ]]; then
 	echo "deploy-site.sh: TCAB_SNAPSHOT_URL is not an http(s) URL: '${TCAB_SNAPSHOT_URL}'" >&2
 	exit 1
@@ -60,7 +62,7 @@ echo "=== npm ci ==="
 npm ci --no-audit --no-fund
 
 # By its directory rather than its package name, which the site decides.
-echo "=== build ${SITE} from ${TCAB_SNAPSHOT_URL} ==="
+echo "=== build ${SITE} reading ${TCAB_SNAPSHOT_URL} ==="
 npm run build -w "$SITE"
 
 echo "=== deploy to ${project} ==="

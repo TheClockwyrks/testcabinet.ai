@@ -65,7 +65,7 @@ seen="token=token account=account snapshot=https://snapshot.example"
 
 out="$(run master)"
 check_equal "master deploys" "0" "$?"
-check_equal "installs, builds the gallery by directory from the snapshot and deploys the production project, from the root" \
+check_equal "installs, builds the gallery by directory with the snapshot URL and deploys the production project, from the root" \
 	"npm ci --no-audit --no-fund [cwd=$repo $seen]
 npm run build -w apps/site [cwd=$repo $seen]
 npx --yes wrangler@4.40.3 pages deploy apps/site/dist --project-name=the-test-cabinet --branch=master [cwd=$repo $seen]" \
@@ -75,7 +75,7 @@ out="$(SNAPSHOT=https://snapshot.staging.example run staging)"
 check_equal "staging deploys" "0" "$?"
 check_contains "to the staging project, as its branch" \
 	"--project-name=the-test-cabinet-staging --branch=staging" "$(cat "$tmp/calls.log")"
-check_contains "built from the snapshot it was handed" \
+check_contains "built with the snapshot URL it was handed" \
 	"npm run build -w apps/site [cwd=$repo token=token account=account snapshot=https://snapshot.staging.example]" \
 	"$(cat "$tmp/calls.log")"
 

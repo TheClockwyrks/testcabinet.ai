@@ -1,5 +1,7 @@
+import type { Comparison } from "@clockwyrks/backend-api/comparison";
 import type { RunRecord, RunSubject } from "@clockwyrks/run-record";
 import type { CodeAnalysisDocument } from "@clockwyrks/run-record/code-analysis";
+import type { GgRunDoc } from "@clockwyrks/run-record/gg-query";
 import {
   DEFAULT_ENGINE_SLUG,
   findModelByModelId,
@@ -12,60 +14,81 @@ import {
   type GalleryDataInput,
   type RunDetail,
   type RunQuery,
+  type SeededInput,
+  type TestCaseDetail,
+  type TestCaseGroupSummary,
+  type TestCaseSummary,
   type VariantSummary,
 } from "@clockwyrks/ui/app";
-import type { HarnessEvent, ProgressCallback } from "@clockwyrks/ui/client";
-import { readOutcome, readTextWithProgress } from "@clockwyrks/ui/client";
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-  useSyncExternalStore,
-} from "react";
-import {
-  runSummaries as publishedRunSummaries,
-  testCases as catalogTestCases,
-  models as catalogModels,
-  comparisons as publishedComparisons,
-  testCaseGroups as publishedTestCaseGroups,
-  ggRuns as publishedGgRuns,
-  catalogShowcaseMediaUrls as publishedCatalogShowcaseMediaUrls,
-} from "virtual:tcab-snapshot";
+import type {
+  HarnessEvent,
+  Model,
+  StoredReview,
+  WorkspaceFileRef,
+} from "@clockwyrks/ui/client";
+import { readOutcome } from "@clockwyrks/ui/client";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { createStaticFiles } from "./static-files";
+import type { AssembledCaseVersionMedia } from "./snapshot/assemble";
+import type { SnapshotDataset, SnapshotReader } from "./snapshot/reader";
 
-// The static site's gallery data source. It is the build-time public R2 snapshot
-// — fully static, never querying the backend at runtime — merged in dev with
+// The static site's gallery data source. The published dataset is read from the
+// public bucket in the browser (see `./snapshot/reader`), merged in dev with
 // produced-but-unpublished runs served from disk by the localRuns plugin. It
 // produces the one `GalleryDataInput` the shared app consumes.
 //
-// The snapshot reaches this module in two forms (see vite-plugin-snapshot). The
-// INDEX — what a listing shows for every run and every case — is inlined into
-// the bundle as `virtual:tcab-snapshot`, so the catalog is always resolved
-// (`testCasesStatus: "ready"`) and an empty snapshot simply renders the empty
-// states. Everything that describes one run or one case in detail is a static
-// file beside the bundle, read through `staticFiles` when a page of that run or
-// case opens. The site cannot run tests, so `canExecute` is false and
-// `inProgress` is empty.
+// The page mounts once the dataset — the run index, the model catalog, the
+// comparisons, the groups and the gg corpus — is in, and this hook is handed it.
+// The case catalog arrives after it (`testCasesStatus` says when), and everything
+// that describes one run is read from that run's document when a page of the run
+// opens. The site cannot run tests, so `canExecute` is false and `inProgress` is
+// empty.
 
-const LOCAL_RUNS_URL = "/__local-runs__/index.json";
-
-// The build's static files, read from the site's own origin. One reader for the
-// page, so every surface shares what it has loaded.
-const staticFiles = createStaticFiles(import.meta.env.BASE_URL);
-
-// The catalog's listing cards by slug. A card lists a version exactly when the
-// build wrote that version's file, so this is also what says which case files
-// exist to ask for.
-const catalogBySlug = new Map(
-  catalogTestCases.map((entry) => [entry.slug, entry]),
-);
-
-/** Whether the build wrote a file for this version of this case. */
-function isPublishedVersion(slug: string, version: string): boolean {
-  return catalogBySlug.get(slug)?.versions.includes(version) ?? false;
+/**
+ * One variant as a case version's file carries it: the gallery's
+ * {@link VariantSummary} (the engineless rendering) plus the same prompt and
+ * specs re-rendered for each engine the version declares that vendors a runtime.
+ * A case's prompt and `.hbs` specs branch on the selected engine, so a run's
+ * Inputs tab reads the entry for the engine its run recorded.
+ *
+ * The app's reading of `AssembledVariant` in `./snapshot/assemble`.
+ */
+interface SnapshotVariant extends VariantSummary {
+  engineRenderings: Record<
+    string,
+    {
+      prompt: string;
+      seededInputs: SeededInput[];
+      /** The variant's effective starter-workspace set for this engine — a
+       * starter project is written against a runtime, so each rendering carries
+       * its own (the engineless set is the variant's own `workspace`). */
+      workspace: WorkspaceFileRef[];
+    }
+  >;
 }
+
+/** The part of a {@link TestCaseDetail} that spans the case's versions. */
+type CaseDetail = Omit<TestCaseDetail, keyof TestCaseSummary | "variants">;
+
+/** The catalog in the app's types. */
+interface Catalog {
+  testCases: TestCaseSummary[];
+  details: Map<string, CaseDetail>;
+  versions: Map<
+    string,
+    { variants: SnapshotVariant[]; media: AssembledCaseVersionMedia }
+  >;
+  catalogShowcaseMediaUrls: Record<string, Record<string, string>>;
+}
+
+/** A catalog's load state, as the gallery reads it. */
+type CatalogStatus = GalleryDataInput["testCasesStatus"];
+
+/** The catalog's load: still loading, assembled, or failed. */
+type CatalogLoad =
+  | { status: "loading" }
+  | { status: "ready"; catalog: Catalog }
+  | { status: "error" };
 
 /**
  * Where one file of a recording's shared image store is, under `prefix`.
@@ -90,20 +113,30 @@ function storeUrl(
 }
 
 // The gallery-wide reviews map of a host that holds none outside a run's own
-// file. One object, so the lookups memoized on it are built once.
+// document. One object, so the lookups memoized on it are built once.
 const NO_REVIEWS: Readonly<Record<string, never>> = {};
+
+const NO_CASES: TestCaseSummary[] = [];
+
+const LOCAL_RUNS_URL = "/__local-runs__/index.json";
 
 interface LocalRunsResponse {
   runs?: RunRecord[];
   writeups?: Record<string, string>;
 }
 
-export function useStaticGallery(): GalleryDataInput {
+export function useStaticGallery(
+  reader: SnapshotReader,
+  dataset: SnapshotDataset,
+): GalleryDataInput {
   const [localRuns, setLocalRuns] = useState<RunRecord[] | null>(null);
   const [localWriteups, setLocalWriteups] = useState<Record<string, string>>(
     {},
   );
   const [loading, setLoading] = useState<boolean>(import.meta.env.DEV);
+  const [catalogLoad, setCatalogLoad] = useState<CatalogLoad>({
+    status: "loading",
+  });
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -130,14 +163,39 @@ export function useStaticGallery(): GalleryDataInput {
     };
   }, []);
 
+  // The catalog, read once the page has mounted. The reader shares one read, so
+  // the resolvers below that await it ask for the same one.
+  useEffect(() => {
+    const mounted = { current: true };
+    void (async () => {
+      try {
+        const catalog = (await reader.catalog()) as Catalog;
+        if (mounted.current) setCatalogLoad({ status: "ready", catalog });
+      } catch (error) {
+        console.error("the gallery could not read the case catalog", error);
+        if (mounted.current) setCatalogLoad({ status: "error" });
+      }
+    })();
+    return () => {
+      mounted.current = false;
+    };
+  }, [reader]);
+
+  const publishedRunSummaries = dataset.runSummaries;
+  const publishedById = useMemo(
+    () =>
+      new Map(publishedRunSummaries.map((summary) => [summary.id, summary])),
+    [publishedRunSummaries],
+  );
+
   // Everything derived from the loaded local runs is memoized on them, so a
-  // render for any other reason — a case version's file arriving — hands the
-  // gallery the same tables and does not restart the surfaces keyed on them.
+  // render for any other reason — the catalog arriving — hands the gallery the
+  // same tables and does not restart the surfaces keyed on them.
   const local = useMemo(() => localRuns ?? [], [localRuns]);
   const localIds = useMemo(() => new Set(local.map((run) => run.id)), [local]);
   // A small in-memory map of the DEV local runs' full records, keyed by id — the
   // only full records held in memory. The lazy `fetchRun` resolves a dev local
-  // run from here; any other id fetches the run's own file.
+  // run from here; any other id reads the run's document.
   const localById = useMemo(
     () => new Map(local.map((run) => [run.id, run])),
     [local],
@@ -148,7 +206,7 @@ export function useStaticGallery(): GalleryDataInput {
   // `queryRunSummaries` below so a listing sorts and pages them with the published
   // rows. Dev-only local runs have no published summary, so derive theirs from the
   // full record (they are unreviewed previews, so no reviews / null rating is
-  // correct). The published summary index stays internal to this module (queried by
+  // correct). The published run index stays internal to this module (queried by
   // `queryRunSummaries` below); it is never exposed whole.
   // A dev-only local run is a legacy-shaped preview: the site has no store to say
   // whether it is validator-rated, so it carries neither channel decided.
@@ -173,12 +231,12 @@ export function useStaticGallery(): GalleryDataInput {
   // catalog already surfaces any model with a recorded run automatically, so the
   // rows this drops are curated-but-never-run entries (added in the console but
   // not yet exercised) — real on a management console, but noise on the public
-  // site. Resolve every run the site knows about (the published snapshot, plus
+  // site. Resolve every run the site knows about (the published run index, plus
   // any dev-only local runs) to its catalog model with the same harness-aware
   // matcher the rest of the app uses, and keep only the models something
   // references.
   const models = useMemo(() => {
-    const allModels = catalogModels.map(toModelSummary);
+    const allModels = (dataset.models as Model[]).map(toModelSummary);
     const referencedModelSlugs = new Set<string>();
     for (const summary of [...publishedRunSummaries, ...producedSummaries]) {
       const model = findModelByModelId(
@@ -189,38 +247,47 @@ export function useStaticGallery(): GalleryDataInput {
       if (model) referencedModelSlugs.add(model.slug);
     }
     return allModels.filter((model) => referencedModelSlugs.has(model.slug));
-  }, [producedSummaries]);
+  }, [dataset, publishedRunSummaries, producedSummaries]);
+  const modelsStatus: CatalogStatus = dataset.modelsFailed ? "error" : "ready";
 
-  // The catalog is the index's listing cards. A case's detail is two files of
-  // the build: the one that spans its versions, and the latest version's own,
-  // which holds the variants a case page opens on. Both are read together when a
-  // visitor opens the case. A slug the catalog does not list has no files to ask
-  // for, and resolves null.
-  const testCases = catalogTestCases;
-  const readTestCase = useCallback(async (slug: string) => {
-    const summary = catalogBySlug.get(slug);
-    if (!summary) return null;
-    const [detail, latest] = await Promise.all([
-      staticFiles.loadCaseDetail(slug),
-      staticFiles.loadCaseVersion(slug, summary.latestVersion),
-    ]);
-    return detail === null || latest === null
-      ? null
-      : { ...summary, ...detail, variants: latest.variants };
-  }, []);
+  const catalog = catalogLoad.status === "ready" ? catalogLoad.catalog : null;
+  const readCatalog = useCallback(
+    async () => (await reader.catalog()) as Catalog,
+    [reader],
+  );
+
+  // The catalog's listing cards. A case's detail is the part that spans its
+  // versions joined with the latest version's variants, which a case page opens
+  // on. A slug the catalog does not list resolves null.
+  const testCases = catalog?.testCases ?? NO_CASES;
+  const testCasesStatus: CatalogStatus = catalogLoad.status;
+  const readTestCase = useCallback(
+    async (slug: string): Promise<TestCaseDetail | null> => {
+      const { testCases: cards, details, versions } = await readCatalog();
+      const summary = cards.find((entry) => entry.slug === slug);
+      const detail = details.get(slug);
+      const latest = summary
+        ? versions.get(`${slug}/${summary.latestVersion}`)
+        : undefined;
+      return summary && detail && latest
+        ? { ...summary, ...detail, variants: latest.variants }
+        : null;
+    },
+    [readCatalog],
+  );
 
   // The inputs one run was given: the variant of the run's OWN case version,
-  // rendered for the run's OWN engine. The build writes a file per published
-  // version, so an older version resolves out of its own file rather than the
-  // latest version's; and a version's file carries each variant's prompt and
-  // specs re-rendered per engine, so a run on an engine reads that engine's
-  // rendering. The engineless slug is the top-level pair, which is what a run
-  // selecting no engine received. A version, variant, or engine this snapshot
-  // does not carry resolves null, which the Inputs tab reports as unavailable.
+  // rendered for the run's OWN engine. The catalog holds every published version,
+  // so an older version resolves out of its own file rather than the latest
+  // version's; and a version's file carries each variant's prompt and specs
+  // re-rendered per engine, so a run on an engine reads that engine's rendering.
+  // The engineless slug is the top-level pair, which is what a run selecting no
+  // engine received. A version, variant, or engine this snapshot does not carry
+  // resolves null, which the Inputs tab reports as unavailable.
   const readCaseVariant = useCallback(
     async (ref: CaseVariantRef): Promise<VariantSummary | null> => {
-      if (!isPublishedVersion(ref.slug, ref.version)) return null;
-      const file = await staticFiles.loadCaseVersion(ref.slug, ref.version);
+      const { versions } = await readCatalog();
+      const file = versions.get(`${ref.slug}/${ref.version}`);
       const variant = file?.variants.find(
         (entry) => entry.slug === ref.variant,
       );
@@ -238,82 +305,77 @@ export function useStaticGallery(): GalleryDataInput {
         workspace: rendering.workspace,
       };
     },
-    [],
+    [readCatalog],
   );
 
-  // The only writeups and reviews this host holds outside a run's own file are
-  // the dev-only local previews. A published run's cards, badges and leaderboard
-  // rows read its rating, aesthetic and score off its summary card, and its page
-  // reads its reviews from the run's file through `readRun`, exactly as the
-  // console's do.
+  // The only writeups and reviews this host holds outside a run's own document
+  // are the dev-only local previews. A published run's cards, badges and
+  // leaderboard rows read its rating, aesthetic and score off its summary card,
+  // and its page reads its reviews from the run's document through `readRun`,
+  // exactly as the console's do.
   const writeups = localWriteups;
   const reviews = NO_REVIEWS;
 
   // The Events tab's data source on the static site: a published run's normalized
-  // event stream, emitted at build time as a per-run static asset by
-  // vite-plugin-snapshot (raw harness output is never published). A run without
-  // events (or one published before they were captured) has no asset at all, and
-  // that is an absence: an empty stream, which the tab renders as a run that
-  // recorded none. Every other outcome — offline, a 500, a truncated body that
-  // won't parse — is a read that FAILED and is thrown, so the tab reports the
-  // failure instead of showing an empty feed for events that exist. Stable
-  // identity so the Events tab doesn't refetch on every render.
+  // event stream, which rides in the run's document (raw harness output is never
+  // published). A run that recorded none is an absence: an empty stream, which the
+  // tab renders as a run that recorded none. A read that FAILED is thrown, so the
+  // tab reports the failure instead of showing an empty feed for events that
+  // exist. Stable identity so the Events tab doesn't refetch on every render.
   const fetchRunEvents = useCallback(
-    async (runId: string, onProgress?: ProgressCallback) => {
-      const response = await staticFiles.response(
-        `run-events/${encodeURIComponent(runId)}.json`,
-        `events for run ${runId}`,
-      );
-      if (response === null) return { events: [], raw: null };
-      // The published event asset can be large, so stream it with transfer
-      // progress for the Events tab's progress bar.
-      const text = await readTextWithProgress(response, onProgress);
-      const events = JSON.parse(text) as HarnessEvent[];
-      return { events, raw: null };
+    async (runId: string) => {
+      const document = await reader.run(runId);
+      return {
+        events: (document?.events ?? []) as HarnessEvent[],
+        raw: null,
+      };
     },
-    [],
+    [reader],
   );
 
   // The Code tab's explorer tier on the static site: a published run's unbounded
-  // code-analysis document, emitted at build time as its own generation-keyed snapshot
-  // object and fetched here on demand (the bounded summary rides on the record, so the
-  // provenance strip and figure table never wait on this). The run's file says where
-  // the document is; the tab holds the run, so the file is normally loaded already.
+  // code-analysis document, its own generation-keyed object, fetched here on
+  // demand (the bounded summary rides on the record, so the provenance strip and
+  // figure table never wait on this). The run's document says where it is; the
+  // tab holds the run, so the document is normally read already.
   //
-  // A run whose file names no document resolves to `null`, which the tab renders as
+  // A run whose document names none resolves to `null`, which the tab renders as
   // "never analysed" — the honest reading, since the corpus is deliberately not
-  // backfilled and therefore starts on the day the analyzer shipped. Stable identity
-  // so the tab doesn't refetch on every render.
-  const readCodeAnalysis = useCallback(async (runId: string) => {
-    let media = staticFiles.runMedia(runId);
-    if (media === undefined) {
-      const file = await staticFiles.loadRun(runId);
-      media = file?.media;
-    }
-    const url = media?.codeAnalysisUrl;
-    if (!url) return null;
-    const response = await fetch(url);
-    // A listed object the store no longer holds is still an absence ("never
-    // analysed"); a read that failed for any other reason is reported as one.
-    return readOutcome(response, `code analysis for run ${runId}`) === "absent"
-      ? null
-      : ((await response.json()) as CodeAnalysisDocument);
-  }, []);
+  // backfilled and therefore starts on the day the analyzer shipped. Stable
+  // identity so the tab doesn't refetch on every render.
+  const readCodeAnalysis = useCallback(
+    async (runId: string) => {
+      let media = reader.runMedia(runId);
+      if (media === undefined) {
+        const document = await reader.run(runId);
+        media = document?.file.media;
+      }
+      const url = media?.codeAnalysisUrl;
+      if (!url) return null;
+      const response = await fetch(url);
+      // A listed object the store no longer holds is still an absence ("never
+      // analysed"); a read that failed for any other reason is reported as one.
+      return readOutcome(response, `code analysis for run ${runId}`) ===
+        "absent"
+        ? null
+        : ((await response.json()) as CodeAnalysisDocument);
+    },
+    [reader],
+  );
 
-  // Lazily resolve one run's detail — its full record plus every review. A
-  // published run's record, reviews and media addresses are one file of the build
-  // (`runs/<id>.json`, written by vite-plugin-snapshot), so a summary-first page
-  // fetches a whole run on demand, and the media resolvers below answer for it
-  // from the moment this resolves. A dev-only local run (which has no file) is
-  // resolved from the in-memory `localById` map first. Wired as the host's
-  // `readRun` hook; the gallery context's `fetchRun` delegates to it. Stable
-  // identity so consumers don't refetch on every render.
+  // Lazily resolve one run's detail — its full record plus every review — from
+  // the run's document, so a summary-first page reads a whole run on demand, and
+  // the media resolvers below answer for it from the moment this resolves. A
+  // dev-only local run (which has no document) is resolved from the in-memory
+  // `localById` map first. Wired as the host's `readRun` hook; the gallery
+  // context's `fetchRun` delegates to it. Stable identity so consumers don't
+  // refetch on every render.
   const fetchRun = useCallback(
     async (runId: string): Promise<RunDetail | null> => {
       const localRun = localById.get(runId);
       // A dev-only local run is by definition not published; everything the
-      // static site serves as a file is. It is also a legacy-shaped, unreviewed
-      // preview (no store to decide its channels).
+      // bucket holds is. It is also a legacy-shaped, unreviewed preview (no
+      // store to decide its channels).
       if (localRun)
         return {
           record: localRun,
@@ -326,40 +388,40 @@ export function useStaticGallery(): GalleryDataInput {
           // page reads `run.showcase` directly.
           showcase: localRun.showcase ?? null,
         };
-      // Only an absent file means this gallery holds no such run, which is what
-      // the run-detail layout prints as "No run found". An offline visitor, a
-      // 500 from the CDN, or a body that won't parse is a read that FAILED and
+      // Only a run the run index does not hold is absent, which is what the
+      // run-detail layout prints as "No run found". An offline visitor, a 500
+      // from the edge, or a body that won't parse is a read that FAILED and
       // throws, so the layout reports the failure instead — the same contract
       // the console's `readRun` follows, and the reason this host must not
       // collapse the two into one null.
-      const file = await staticFiles.loadRun(runId);
-      if (file === null) return null;
+      const document = await reader.run(runId);
+      if (document === null) return null;
+      const record = document.file.record as RunRecord;
       // The published summary card carries the store's word on the two rating
       // channels and whether the run is validator-rated — the same fields the
       // console reads off `GET /runs/{id}`.
-      const summary = publishedRunSummaries.find((s) => s.id === runId);
+      const summary = publishedById.get(runId);
       return {
-        record: file.record,
-        reviews: file.reviews,
+        record,
+        reviews: document.file.reviews as StoredReview[],
         published: true,
         validatorRated: summary?.validatorRated ?? false,
         rating: summary?.rating ?? null,
         aesthetic: summary?.aesthetic ?? null,
-        showcase: file.record.showcase ?? null,
+        showcase: record.showcase ?? null,
       };
     },
-    [localById],
+    [reader, localById, publishedById],
   );
 
   // Answer a paged summary query purely in memory — the static analog of the
-  // console's backend offset endpoint. The queryable set is the published summary
+  // console's backend offset endpoint. The queryable set is the published run
   // index (minus any dev local overrides, which the local card supersedes), plus —
   // for the `any` slice the listings ask for — the dev-only produced runs, so an
   // unpublished preview sorts and pages among the published rows exactly as it does
   // against the backend's `any` slice. `runSummaryPage` filters/sorts/windows the
   // set with the same semantics the backend uses, so a numbered page behaves
-  // identically on both hosts. Stable identity keyed on the loaded local runs (the
-  // only varying input).
+  // identically on both hosts.
   const queryRunSummaries = useCallback(
     async (query: RunQuery) => {
       const published = publishedRunSummaries.filter(
@@ -372,96 +434,83 @@ export function useStaticGallery(): GalleryDataInput {
         query,
       );
     },
-    [localIds, producedSummaries],
+    [publishedRunSummaries, localIds, producedSummaries],
   );
 
-  // The cabinet's headline figures, folded locally from the inlined published
-  // summary index with the mirror of the backend's `fold_cabinet_stats` — the
-  // static analog of the console's `GET /stats/cabinet`. The site's corpus is
-  // the published snapshot alone (the backend's additionally counts unpublished
-  // runs), so the figures are the published cabinet's. Pure and in-memory, so it
-  // never rejects; async only to satisfy the host contract. Stable identity so
-  // the home page doesn't refetch on every render.
+  // The cabinet's headline figures, folded locally from the published run index
+  // with the mirror of the backend's `fold_cabinet_stats` — the static analog of
+  // the console's `GET /stats/cabinet`. The site's corpus is the published
+  // snapshot alone (the backend's additionally counts unpublished runs), so the
+  // figures are the published cabinet's. Pure and in-memory, so it never
+  // rejects; async only to satisfy the host contract.
   const getCabinetStats = useCallback(
     async (): Promise<CabinetStats | null> =>
       foldCabinetStats(publishedRunSummaries, new Date()),
-    [],
+    [publishedRunSummaries],
   );
 
-  // A published run's media, each resolved at build time to an absolute snapshot
-  // URL and carried in the run's own file. These resolvers are synchronous and
-  // answer from the files `readRun` has loaded: a surface that holds a run got it
-  // through `readRun`, so the run's media is on hand by the time it asks.
-  // Produced (local, dev-only) runs are not published, so they have no snapshot
-  // media. Stable identities, so a surface keyed on one never refetches.
+  // A published run's media, each resolved to an absolute bucket URL from the
+  // run's document. These resolvers are synchronous and answer from the documents
+  // `readRun` has read: a surface that holds a run got it through `readRun`, so
+  // the run's media is on hand by the time it asks. Produced (local, dev-only)
+  // runs are not published, so they have no published media. Stable identities,
+  // so a surface keyed on one never refetches.
 
   // Proof media, keyed by served file name (`<proof-id>.<ext>`).
   const proofMediaUrl = useCallback(
     (runId: string, file: string): string | null =>
-      staticFiles.runMedia(runId)?.proof[file] ?? null,
-    [],
+      reader.runMedia(runId)?.proof[file] ?? null,
+    [reader],
   );
 
   // Asset-generation media (regenerated/preview/target image + action log), keyed
   // by served file name (`regenerated.png`, etc.).
   const assetMediaUrl = useCallback(
     (runId: string, file: string): string | null =>
-      staticFiles.runMedia(runId)?.asset[file] ?? null,
-    [],
+      reader.runMedia(runId)?.asset[file] ?? null,
+    [reader],
   );
 
   // The synthesized *actual* validation media (the model build's debug-script
   // outputs), keyed by the flat `<item>__<output>.<ext>` name the reviewer UI
   // requests (a video's `.webm` request resolving to its published `.mp4`). A
   // recording's shared image store resolves under the run's one prefix.
-  const validationMediaUrl = useCallback((runId: string, file: string) => {
-    const media = staticFiles.runMedia(runId);
-    return (
-      media?.validation[file] ?? storeUrl(media?.validationStorePrefix, file)
-    );
-  }, []);
+  const validationMediaUrl = useCallback(
+    (runId: string, file: string) => {
+      const media = reader.runMedia(runId);
+      return (
+        media?.validation[file] ?? storeUrl(media?.validationStorePrefix, file)
+      );
+    },
+    [reader],
+  );
 
   // Showcase media (the carousel files, plus any image the description
   // references), keyed by the recorded file name (a video's `.webm` request
   // resolving to its published `.mp4`).
   const showcaseMediaUrl = useCallback(
     (runId: string, file: string): string | null =>
-      staticFiles.runMedia(runId)?.showcase[file] ?? null,
-    [],
+      reader.runMedia(runId)?.showcase[file] ?? null,
+    [reader],
   );
 
-  // A case version's media is carried in that version's own file, and the three
-  // resolvers below answer from the versions loaded so far. A surface showing a
-  // case holds a variant it got through `readTestCase` or `readCaseVariant`, so
-  // its version is on hand; a run's page compares against a baseline of a case
-  // version nothing on the page need have loaded. So a resolver asked about a
-  // published version that is not loaded starts loading it and answers null, and
-  // each takes a new identity when a version arrives — which re-renders the
-  // surfaces reading it through the gallery, now with the answer.
-  const caseVersionsLoaded = useSyncExternalStore(
-    staticFiles.subscribe,
-    staticFiles.revision,
-  );
+  // A case version's media is in the catalog, and the three resolvers below
+  // answer from it. Before the catalog arrives they answer null, and each takes
+  // a new identity when it does — which re-renders the surfaces reading them
+  // through the gallery, now with the answer.
   const caseVersionMedia = useCallback(
-    (slug: string, version: string) => {
-      const file = staticFiles.caseVersion(slug, version);
-      if (file === undefined && isPublishedVersion(slug, version)) {
-        staticFiles.requestCaseVersion(slug, version);
-      }
-      return file?.media;
-    },
-    // The count of loaded versions is what this reads through `staticFiles`.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [caseVersionsLoaded],
+    (slug: string, version: string) =>
+      catalog?.versions.get(`${slug}/${version}`)?.media,
+    [catalog],
   );
 
   // A CASE variant's authored showcase media (the carousel captured from the
   // reference implementation) — the case-side counterpart of the run showcase
   // above, keyed by variant then the authored file name (a video's `.webm`
   // request resolving to its published `.mp4`). The media a catalog card
-  // previews is in the index, so the catalog shows it without loading any case.
-  // Null for a variant with no published showcase, and the surfaces then degrade
-  // exactly like the run showcase.
+  // previews may be of a version no published run built, so it is looked up
+  // first. Null for a variant with no published showcase, and the surfaces then
+  // degrade exactly like the run showcase.
   const caseShowcaseMediaUrl = useCallback(
     (
       slug: string,
@@ -469,12 +518,12 @@ export function useStaticGallery(): GalleryDataInput {
       variant: string,
       file: string,
     ): string | null =>
-      publishedCatalogShowcaseMediaUrls[`${slug}/${version}/${variant}`]?.[
+      catalog?.catalogShowcaseMediaUrls[`${slug}/${version}/${variant}`]?.[
         file
       ] ??
       caseVersionMedia(slug, version)?.showcase[variant]?.[file] ??
       null,
-    [caseVersionMedia],
+    [catalog, caseVersionMedia],
   );
 
   // A published reference build's *baseline* validation media (the reference
@@ -499,11 +548,9 @@ export function useStaticGallery(): GalleryDataInput {
   );
 
   // An asset-generation case variant's published reference frames — the rendered
-  // image and the action log each was drawn from. Resolved at build time by joining
-  // the snapshot base with the deterministic keys `tcab publish-reference` wrote
-  // (see vite-plugin-snapshot), and keyed by variant then the file below that
-  // variant's prefix (`frames/<index>.png`). Null for a variant with no published
-  // reference, which is every non-asset case.
+  // image and the action log each was drawn from — keyed by variant then the file
+  // below that variant's prefix (`frames/<index>.png`). Null for a variant with no
+  // published reference, which is every non-asset case.
   const referenceMediaUrl = useCallback(
     (
       slug: string,
@@ -515,6 +562,29 @@ export function useStaticGallery(): GalleryDataInput {
     [caseVersionMedia],
   );
 
+  const comparisons = useMemo(
+    () => dataset.comparisons as Comparison[],
+    [dataset],
+  );
+  const readComparison = useCallback(
+    (id: string) => comparisons.find((c) => c.id === id) ?? null,
+    [comparisons],
+  );
+  const testCaseGroups = useMemo(
+    () => dataset.testCaseGroups as TestCaseGroupSummary[],
+    [dataset],
+  );
+  const ggData = useMemo(
+    () =>
+      dataset.ggRuns
+        ? {
+            generatedAt: dataset.ggRuns.generatedAt,
+            documents: dataset.ggRuns.documents as GgRunDoc[],
+          }
+        : undefined,
+    [dataset],
+  );
+
   return {
     producedSummaries,
     localIds,
@@ -524,33 +594,30 @@ export function useStaticGallery(): GalleryDataInput {
     queryRunSummaries,
     getCabinetStats,
     testCases,
-    testCasesStatus: "ready",
-    // The test-case groups, baked into the index at build time and already in
-    // display order. Empty when the snapshot predates them, and the home page
-    // then renders no group leaderboards.
-    testCaseGroups: publishedTestCaseGroups,
+    testCasesStatus,
+    // The test-case groups, already in display order. Empty when the snapshot
+    // predates them, and the home page then renders no group leaderboards.
+    testCaseGroups,
     readCaseVariant,
     readTestCase,
-    // The model catalog is baked into the snapshot at build time, so it is always
-    // resolved; the site has no backend to mutate it, so the config affordances
-    // hide (no `createModel` on any client here). Narrowed above to the models a
-    // run has actually used, so run-less curated entries don't show here.
+    // The model catalog, read with the dataset; the site has no backend to mutate
+    // it, so the config affordances hide (no `createModel` on any client here).
+    // Narrowed above to the models a run has actually used, so run-less curated
+    // entries don't show here.
     models,
-    modelsStatus: "ready",
-    // The published harness comparisons, baked into the snapshot at build time and
-    // rendered read-only (no backend to create/run/publish — those affordances gate
-    // on `canExecute`, which is false here). A single comparison is resolved by id
-    // for the detail view.
-    comparisons: publishedComparisons,
-    readComparison: (id: string) =>
-      publishedComparisons.find((c) => c.id === id) ?? null,
+    modelsStatus,
+    // The published harness comparisons, rendered read-only (no backend to
+    // create/run/publish — those affordances gate on `canExecute`, which is false
+    // here). A single comparison is resolved by id for the detail view.
+    comparisons,
+    readComparison,
     canExecute: false,
-    // The exported gg document corpus, inlined with the index at build time. This is the whole of the
-    // site's analysis surface: `useGgSource` evaluates every query against these
+    // The exported gg document corpus, read with the dataset. This is the whole of
+    // the site's analysis surface: `useGgSource` evaluates every query against these
     // documents in the browser with the mirrored evaluator, so `/gg/query` makes no
     // request at all. A snapshot without the corpus (one published before the export
     // existed) leaves this undefined, and the section is simply not mounted.
-    ggData: publishedGgRuns ?? undefined,
+    ggData,
     // The public gallery has no backend to ask for a Grafana URL, and its readers
     // have no access to one — Grafana sits behind the edge's Access sign-in. Always
     // null, so the run view never offers a link nobody could follow.
@@ -558,7 +625,7 @@ export function useStaticGallery(): GalleryDataInput {
     fetchRunEvents,
     readCodeAnalysis,
     // The host's lazy single-run fetcher; the gallery context's `fetchRun`
-    // delegates to it (falling back to the in-memory `runs` internally).
+    // delegates to it.
     readRun: fetchRun,
     proofMediaUrl,
     assetMediaUrl,

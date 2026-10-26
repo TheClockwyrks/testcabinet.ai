@@ -1,17 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import {
   createSnapshotFetcher,
-  DEFAULT_CONCURRENCY,
   forEachOrdered,
-  resolveConcurrency,
   SnapshotFetchError,
   type SnapshotFetch,
-} from "./snapshot-fetch";
+} from "./fetch";
 
 const URL_A = "https://snapshot.example/runs/a.json";
 
 function ok(body: unknown): Response {
-  return new Response(JSON.stringify(body), { status: 200 });
+  return Response.json(body, { status: 200 });
 }
 
 function status(code: number, text: string): Response {
@@ -19,7 +18,7 @@ function status(code: number, text: string): Response {
 }
 
 /** A `fetch` that answers each call with the next scripted step. */
-function scripted(steps: Array<() => Promise<Response>>): {
+function scripted(steps: (() => Promise<Response>)[]): {
   fetch: SnapshotFetch;
   calls: () => number;
 } {
@@ -35,26 +34,55 @@ function scripted(steps: Array<() => Promise<Response>>): {
   };
 }
 
-/** A promise settled by hand, for tasks that must finish out of order. */
-function deferred<T>(): {
+interface Deferred<T> {
   promise: Promise<T>;
   resolve: (value: T) => void;
   reject: (error: unknown) => void;
-} {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
+}
+
+/**
+ * `Promise`, typed with `withResolvers`, which every runtime the tests run in
+ * has though the compiled library (ES2022) does not declare it.
+ */
+const PromiseWithResolvers = Promise as PromiseConstructor & {
+  withResolvers: <T>() => Deferred<T>;
+};
+
+/** A promise settled by hand, for tasks that must finish out of order. */
+function deferred<T>(): Deferred<T> {
+  return PromiseWithResolvers.withResolvers<T>();
+}
+
+/** A promise that never settles. */
+function never<T>(): Promise<T> {
+  return deferred<T>().promise;
+}
+
+/** A consumer that ignores what it is given. */
+function ignore(): void {
+  // Nothing to consume.
 }
 
 /** The outcome of a promise, captured so a rejection is never left unhandled. */
-function settle<T>(promise: Promise<T>): Promise<T | Error> {
-  return promise.then(
-    (value) => value,
-    (error: unknown) => error as Error,
+async function settle<T>(promise: Promise<T>): Promise<T | Error> {
+  try {
+    return await promise;
+  } catch (error: unknown) {
+    return error as Error;
+  }
+}
+
+/** A response whose body sends half a document and then stalls. */
+function stalled(): Promise<Response> {
+  return Promise.resolve(
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"half":'));
+        },
+      }),
+      { status: 200 },
+    ),
   );
 }
 
@@ -203,9 +231,7 @@ describe("createSnapshotFetcher", () => {
       fetch: (_url, init) => {
         calls += 1;
         signals.push(init.signal);
-        return calls === 1
-          ? new Promise<Response>(() => undefined)
-          : Promise.resolve(ok("late"));
+        return calls === 1 ? never<Response>() : Promise.resolve(ok("late"));
       },
       random: () => 1,
     });
@@ -224,22 +250,11 @@ describe("createSnapshotFetcher", () => {
   });
 
   it("times out an attempt whose body never finishes", async () => {
-    const stalled = (): Promise<Response> =>
-      Promise.resolve(
-        new Response(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.enqueue(new TextEncoder().encode('{"half":'));
-            },
-          }),
-          { status: 200 },
-        ),
-      );
     const script = scripted([stalled]);
     const fetcher = createSnapshotFetcher({
       fetch: script.fetch,
       attempts: 2,
-      attemptTimeoutMs: 1_000,
+      attemptTimeoutMs: 1000,
     });
 
     const result = settle(fetcher.json(URL_A));
@@ -299,13 +314,17 @@ describe("forEachOrdered", () => {
     const done = forEachOrdered(
       items,
       4,
-      (_item, index) => (gates[index] as (typeof gates)[number]).promise,
+      (_item, index) => {
+        const gate = gates[index];
+        if (gate === undefined) throw new Error(`no gate ${String(index)}`);
+        return gate.promise;
+      },
       (result, item, index) => {
-        consumed.push(`${index}:${item}:${result}`);
+        consumed.push(`${String(index)}:${item}:${result}`);
       },
     );
     for (const index of [3, 2, 1]) {
-      gates[index]?.resolve(`r${index}`);
+      gates[index]?.resolve(`r${String(index)}`);
       await vi.advanceTimersByTimeAsync(0);
     }
     // Nothing is consumed while the first item is outstanding.
@@ -383,7 +402,7 @@ describe("forEachOrdered", () => {
         finished.push(item);
         return item;
       },
-      () => undefined,
+      ignore,
     );
 
     expect(started).toEqual([0, 1, 2]);
@@ -391,7 +410,7 @@ describe("forEachOrdered", () => {
 
   it("resolves at once for no items", async () => {
     const task = vi.fn<() => Promise<number>>();
-    await forEachOrdered([], 8, task, () => undefined);
+    await forEachOrdered([], 8, task, ignore);
     expect(task).not.toHaveBeenCalled();
   });
 
@@ -436,24 +455,5 @@ describe("forEachOrdered", () => {
     );
 
     expect((error as Error).message).toBe("bad result");
-  });
-});
-
-describe("resolveConcurrency", () => {
-  it("defaults when the variable is unset or blank", () => {
-    expect(resolveConcurrency(undefined)).toBe(DEFAULT_CONCURRENCY);
-    expect(resolveConcurrency("  ")).toBe(DEFAULT_CONCURRENCY);
-    expect(DEFAULT_CONCURRENCY).toBe(8);
-  });
-
-  it("takes a positive integer", () => {
-    expect(resolveConcurrency("1")).toBe(1);
-    expect(resolveConcurrency(" 16 ")).toBe(16);
-  });
-
-  it.each(["0", "-2", "1.5", "eight", "08"])("refuses %s", (raw) => {
-    expect(() => resolveConcurrency(raw)).toThrow(
-      "TCAB_SNAPSHOT_CONCURRENCY must be a positive integer",
-    );
   });
 });

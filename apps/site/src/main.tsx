@@ -1,9 +1,7 @@
-import { GalleryApp, GalleryDataProvider } from "@clockwyrks/ui/app";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { RouterProvider, createBrowserRouter } from "react-router";
 
-import { useStaticGallery } from "./staticGallery";
+import { SiteApp } from "./site-app";
 
 // A deep link such as /runs/<id> arrives at its own URL: with no `404.html` in the
 // build, Cloudflare Pages answers an unmatched path with the app shell and a 200
@@ -12,22 +10,6 @@ import { useStaticGallery } from "./staticGallery";
 const rootElement = document.querySelector("#root");
 if (!rootElement) {
   throw new Error("#root element not found in index.html");
-}
-
-// A data router, the same as the console's: the gallery declares its own routes beneath
-// the one catch-all route here.
-const router = createBrowserRouter([{ path: "*", element: <GalleryApp /> }]);
-
-// The static gallery: the shared app (from @clockwyrks/ui) rendered with the
-// build-time snapshot as its data source. Its global styles come in as a side
-// effect of importing the shared app entry.
-function SiteApp() {
-  const data = useStaticGallery();
-  return (
-    <GalleryDataProvider value={data}>
-      <RouterProvider router={router} />
-    </GalleryDataProvider>
-  );
 }
 
 createRoot(rootElement).render(

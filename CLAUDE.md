@@ -30,9 +30,9 @@ accordingly.
 | `.test-cabinet-repo.toml` | The name, kind and description, rendered from those answers for the `dependency-edges` gate to read |
 | `azure-pipelines.yml` | The pipeline: every gate a step of its own on Azure Pipelines |
 | `apps/site/` | The gallery: a Vite and React host of `@clockwyrks/ui` |
+| `apps/site/src/snapshot/` | The gallery's reader of the published dataset, fetched in the browser from the bucket at `TCAB_SNAPSHOT_URL`, with its tests |
 | `apps/preview-tags/` | The preview-tag Worker on the gallery's run routes, with its `wrangler.toml` |
 | `apps/share-links/` | The `tcab.ai` share-link Worker, with its `wrangler.toml` |
-| `apps/site/vite-plugin-snapshot.ts` | The build's plugin that fetches the published dataset from `TCAB_SNAPSHOT_URL` and bakes it into the bundle, with its tests |
 | `apps/site/scripts/` | The screenshot helper and the backdrop capture, run from a checkout |
 | `eslint.config.js`, `eslint-suppressions.json` | The `web-lint` gate's configuration and its ratchet |
 | `scripts/ci/` | The pipeline's scripts, the kit's and the deploys of the gallery and its Workers, each with its `.test.sh` |
